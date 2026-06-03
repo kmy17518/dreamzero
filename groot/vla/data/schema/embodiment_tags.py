@@ -187,6 +187,13 @@ class EmbodimentTag(Enum):
     The Libero Sim dataset.
     """
 
+    LIBERO = "libero"
+    """
+    The LIBERO benchmark dataset (openpi LeRobot format) converted to GEAR.
+    2 cameras (agentview `image`, eye-in-hand `wrist_image`), 8-dim state, 7-dim
+    delta end-effector action.
+    """
+
     DROID_SIM = "droid_sim"
     """
     The Droid dataset in sim.

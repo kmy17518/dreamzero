@@ -1,0 +1,54 @@
+# @package _global_
+# LIBERO data config for Wan 5B (Wan2.2): 320x160 so latent is 20x10 (even H,W) with
+# WanVideoVAE38 (16x), frame_seqlen=50. Mirrors droid_relative_wan22 but for the LIBERO
+# embodiment (2 cameras, 8-dim state, 7-dim delta end-effector action).
+#
+# LIBERO actions are delta end-effector commands (not absolute joint targets), so we do
+# NOT use relative actions: relative_action=false (actions are normalized directly).
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_
+
+# Wan 5B: 160x320 (HxW) -> latent 10x20, (10//2)*(20//2)=50. H,W divisible by 32 -> even latent (no crop in loss).
+image_resolution_width: 320
+image_resolution_height: 160
+
+max_state_dim: 64
+use_global_metadata: false
+relative_action: false
+relative_action_per_horizon: false
+relative_action_keys: []
+max_chunk_size: 5
+dataset_shard_sampling_rate: 0.1
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+libero_data_root: ???
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        libero:
+          - ${libero_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}

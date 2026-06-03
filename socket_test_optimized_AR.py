@@ -741,8 +741,12 @@ def main(args: Args) -> None:
     # Set environment variable for DIT cache.
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
 
-    # Use TE cuDNN backend for attention.
-    os.environ["ATTENTION_BACKEND"] = "TE"
+    # Use Flash Attention 2 instead of TE: TE >=2.15 changed fused_attn_fwd's
+    # signature (groot's cudnn_attention.py doesn't pass the new NVTE_QKV_Format
+    # args), and TE 2.10's bundled cuDNN conflicts with torch's cuDNN
+    # (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED on conv2d). wan2_1_attention.py
+    # falls back to FA2 cleanly when backend != "TE".
+    os.environ["ATTENTION_BACKEND"] = "FA2"
 
     # Increase the recompile limit to 100 for inference due
     # to autoregressive nature of the model (several possible shapes).

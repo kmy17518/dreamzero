@@ -111,9 +111,19 @@ If you persisted the converted GEAR datasets, just copy them back to
 Otherwise, recreate them (download raw → LeRobot → GEAR). Set `HF_TOKEN` first
 (`cs224r_custom_private/.env` had one on the old box; you'll need your own):
 
+**Where libero-100 comes from** (downloaded by `scripts/download_libero100_local.py`; all
+"no_noops" = the OpenVLA regeneration: 256px, 180° rotation, no-op + failed-trajectory
+filtering):
+
+| Suite | HF source repo | Notes |
+|---|---|---|
+| `libero_10_no_noops` | `openvla/modified_libero_rlds` (dataset) | canonical; the exact source `physical-intelligence/libero` was converted from |
+| `libero_90_no_noops` | `real-lab/libero_filtered_noops_rlds_dataset` (dataset) | OpenVLA's RLDS repo has no libero_90; this regenerates it. Its `wrist_image` is 128×128 (vs libero_10's 256×256) — the converter upscales the wrist to 256×256 for a uniform schema |
+| reference (verification only) | `physical-intelligence/libero` (dataset) | LeRobot dataset used to check the conversion |
+
 ```bash
 cd /root/cs224r_custom_private
-# a) download raw RLDS + reference LeRobot (~75 GB)
+# a) download raw RLDS + reference LeRobot (~75 GB) from the HF repos in the table above
 python scripts/download_libero100_local.py
 # b) RLDS -> LeRobot (produces data/libero100/{libero-10,libero-90})
 python scripts/convert_libero100_to_lerobot.py        # see script header for args

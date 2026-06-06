@@ -277,26 +277,43 @@ The frozen modules load from local files (no downloads): DiT base = `Wan2.2-TI2V
 `image_encoder_pretrained_path=…/Wan2.1…/models_clip…pth`,
 `vae_pretrained_path=…/Wan2.2_VAE.pth`, `tokenizer_path=…/umt5-xxl`.
 
-### 6.1 Optimal batch size (measured)
+### 6.1 Per-device batch size > 1 (bug fixed; now supported)
 
-Full fine-tune of the 5B model with ZeRO-2 on H100 80GB:
+Originally `per_device_train_batch_size > 1` crashed in the action-head loss:
+`RuntimeError: The size of tensor a (2) must match the size of tensor b (96)` at
+`wan_flow_matching_action_tf.py:795`. **This was a one-line broadcasting bug, not an architectural
+or memory limit** — the model forward, action/state encoders, RoPE, and attention are all batch-safe;
+only the loss masking line used `has_real_action[:, None]` (`[B, 1]`) against the `[B, 96, action_dim]`
+action loss. At `B=1` `[1,1]` broadcasts fine; at `B>1` `[B,1]` collides with the `96` (action-register
+length = #blocks × num_action_per_block / num_frame_per_block).
+
+**Fix:** `has_real_action[:, None, None]` (broadcast over `[B, T_action, action_dim]`). With this,
+bs>1 trains.
+
+Validation (all on a single free GPU):
+- **Unit test** `scripts/test_action_loss_batch.py` (PASS): reproduces the old bs=2 crash and proves
+  the fixed loss is per-sample independent — `loss([A,B]) == mean(loss(A), loss(B))` (rel `0`) — and
+  that `has_real_action` masks per-sample.
+- **End-to-end bs=2 run**: 6 full steps (fwd+bwd+optimizer) completed with `videos torch.Size([2, 3, 33, 160, 640])`
+  (batch=2) and losses matching bs=1 (`dynamics≈0.91`, `action≈0.23`).
+
+Memory / how big can it go (H100 80 GB):
 
 | `per_device_train_batch_size` | result |
 |---|---|
-| **1** | **works; ~46.5 GB / GPU, ~1.7 s/step** ✅ (this is the optimal/maximum) |
-| 2 | **crashes** in the action-head loss: `RuntimeError: The size of tensor a (2) must match the size of tensor b (96)` at `wan_flow_matching_action_tf.py:795` ❌ |
+| 1 | ~46.5 GB / GPU (7-GPU ZeRO-2), ~1.7 s/step |
+| 2 | works (validated); ~66 GB / GPU on 1 GPU with the optimizer CPU-offloaded |
+| ≥3 | not validated; likely OOM on 80 GB — confirm on the real node |
 
-**Conclusion: the optimal (and maximum supported) per-device batch size is `1`.** This is a model
-limitation, not a memory limit — bs=1 uses only ~46.5 GB of 80 GB, but the action-head training
-`forward` (the joint video+action flow-matching loss, e.g. `has_real_action[:, None] * action_loss_per_sample`
-and the action-register packing) assumes one sample per device. **Every official DreamZero training
-script (`droid_training*.sh`, `agibot_training.sh`, `yam_training.sh`) uses
-`per_device_train_batch_size=1`** for the same reason.
-
-To grow the **effective/global** batch size, scale the orthogonal knobs instead:
-- more data-parallel GPUs (global batch = `NUM_GPUS × 1 × grad_accum`), and/or
-- `gradient_accumulation_steps` (HF Trainer; calls the bs=1 forward N times) — e.g. add
-  `training_args.gradient_accumulation_steps=4` to the launcher overrides.
+Notes:
+- Per-device bs>1 is **activation-bound**, and the optimal value should be re-measured on the actual
+  8-GPU node. With ZeRO-2 the ~60 GB fp32 optimizer is sharded across GPUs, so on 8×80 GB bs=2 should
+  fit comfortably and bs=3 is the next thing to try.
+- **No gradient accumulation needed** — this enables true per-device batching (faster than grad-accum).
+- **Single-GPU full fine-tune is optimizer-memory-bound** (ZeRO-2 can't shard the optimizer with 1 GPU),
+  so the bs=2 validation above used CPU optimizer offload:
+  `DEEPSPEED_CONFIG=groot/vla/configs/deepspeed/zero2_offload.json` (and put the env's `bin/` on `PATH`
+  so DeepSpeed's `cpu_adam` JIT finds `ninja`). On a multi-GPU node use the default `zero2.json`.
 
 Training step time ≈ 1.7 s/step (bs=1, 7 GPUs); the only slow gap is the ~20 s shard cache when
 the sharded loader moves to a new shard. `loss_log.jsonl` records `dynamics_loss` (video) and

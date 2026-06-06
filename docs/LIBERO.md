@@ -1,0 +1,439 @@
+# Training & Evaluating DreamZero on LIBERO (Wan2.2-TI2V-5B backbone, full fine-tune)
+
+This guide documents everything needed to **train DreamZero on the LIBERO dataset using the
+Wan2.2-TI2V-5B backbone (full fine-tune, no LoRA)** and to **evaluate it in the LIBERO MuJoCo
+simulator** (auto-scoring success, saving rollout videos and a metrics JSON, like
+`openpi/examples/libero/main.py`).
+
+It records the critical decisions, the exact environment setup, the data conversion, the code
+that was added/modified, and the commands used to verify training + eval.
+
+> **Reading note.** The eval is **client–server**: a DreamZero policy server (GPU, `dreamzero`
+> env) serves actions over a websocket; the LIBERO simulator runs as a separate client (CPU,
+> `dreamzero_libero` env). This is why two conda environments are used.
+
+---
+
+## 0. TL;DR — what was built
+
+New embodiment `libero_sim` (2 cameras, 8-dim eef state, 7-dim delta action) wired end-to-end:
+
+| Area | File(s) |
+|---|---|
+| Embodiment projector index | `groot/vla/configs/model/dreamzero/transform/base.yaml` (`libero_sim: 33`) |
+| Modality config + transform | `groot/vla/configs/data/dreamzero/base_48_wan_fine_aug_relative.yaml` (`modality_config_libero_sim`, `transform_libero_sim`, registered in the `modality_configs`/`transforms`/`metadata_versions`/`fps` dicts) |
+| Data config (Wan2.2) | `groot/vla/configs/data/dreamzero/libero_relative_wan22.yaml` |
+| Language template + 2-view video layout | `groot/vla/model/dreamzero/transform/dreamzero_cotrain.py` (`collate()` + `_prepare_video()` `LIBERO_SIM` branches) |
+| Dataset conversion | `scripts/data/convert_libero_to_dreamzero.py` |
+| Training launcher | `scripts/train/libero_training_wan22.sh` |
+| Eval server (policy) | `eval_utils/serve_dreamzero_libero.py` |
+| Eval client (sim) | `eval_utils/run_libero_eval.py` |
+
+`EmbodimentTag.LIBERO_SIM = "libero_sim"` already existed in `groot/vla/data/schema/embodiment_tags.py`.
+
+---
+
+## 1. Hardware used & a critical constraint
+
+- 8× H100 80GB, 208 CPUs, ~1.7 TB RAM, 22 TB disk.
+- **GPU 0 was occupied by another user's job (~76 GB, 100% util) for the entire session.** All
+  training/eval here therefore ran on **GPUs 1–7 (7 GPUs)**. The training launcher defaults to
+  `NUM_GPUS=8`; to reproduce on a fully free node use `NUM_GPUS=8` and drop `CUDA_VISIBLE_DEVICES`.
+  Per-GPU memory (and thus the optimal batch size) is activation-bound and essentially identical
+  for 7 vs 8 GPUs with ZeRO-2.
+
+---
+
+## 2. Conda environments
+
+Two environments are used (the eval is client–server, and LIBERO pins old
+`robosuite`/`mujoco`/`gym` that conflict with DreamZero's torch 2.8 / py3.11 stack — a single
+unified env is not practical, and is unnecessary because the two halves talk over a websocket).
+
+Conda base used here: `/home/ubuntu/jiajun-stanford-lab/projects/miniconda3` (the only conda on
+the box). Adjust if your conda differs.
+
+### 2.1 `dreamzero` — training + policy serving (GPU)
+
+```bash
+conda create -n dreamzero python=3.11 -y
+conda activate dreamzero
+
+cd /home/ubuntu/minyeong/dreamzero
+export CUDA_HOME=/usr/local/cuda                      # CUDA 12.8 toolkit present on the box
+pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129
+MAX_JOBS=32 pip install --no-build-isolation flash-attn
+```
+
+This installs torch 2.8 (cu129) and `flash-attn` 2.8.3 (compiles in ~15 min; needs `nvcc` + gcc).
+
+### 2.2 `dreamzero_libero` — LIBERO MuJoCo simulator client (CPU)
+
+The sim client needs **no GPU and no torch-CUDA** — it renders MuJoCo on CPU/EGL and talks to
+the policy server over websocket. LIBERO's `benchmark` module imports `torch`, so a CPU torch is
+installed.
+
+```bash
+conda create -n dreamzero_libero python=3.10 -y
+conda activate dreamzero_libero
+
+# pin build tooling first (gym 0.25.2 needs old setuptools/wheel)
+pip install "setuptools==65.5.0" "wheel==0.38.4" "pip==23.3.2"
+pip install "numpy==1.24.4"
+pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+pip install "robosuite==1.4.1" "mujoco==3.2.3" "bddl==1.0.1" "easydict==1.9" \
+            "opencv-python==4.6.0.66" Pillow "matplotlib==3.5.3"
+pip install "gym==0.25.2" --no-build-isolation
+
+# LIBERO itself (clone + editable, deps already installed above)
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git /home/ubuntu/minyeong/LIBERO
+pip install -e /home/ubuntu/minyeong/LIBERO --no-deps
+
+# client deps (DreamZero websocket protocol + misc)
+pip install websockets msgpack msgpack-numpy openpi-client tqdm tyro imageio imageio-ffmpeg \
+            "hydra-core==1.2.0" termcolor future cloudpickle
+```
+
+Create LIBERO's config (points at the bundled bddl/init/asset files):
+
+```bash
+mkdir -p ~/.libero && cat > ~/.libero/config.yaml <<'YAML'
+benchmark_root: /home/ubuntu/minyeong/LIBERO/libero/libero
+bddl_files:     /home/ubuntu/minyeong/LIBERO/libero/libero/bddl_files
+init_states:    /home/ubuntu/minyeong/LIBERO/libero/libero/init_files
+datasets:       /home/ubuntu/minyeong/LIBERO/libero/datasets
+assets:         /home/ubuntu/minyeong/LIBERO/libero/libero/assets
+YAML
+```
+
+Headless rendering: run the client with `MUJOCO_GL=egl` (use `MUJOCO_GL=glx` if you hit EGL
+errors). The `datasets path ... does not exist` warning is harmless — we only need the simulator,
+not LIBERO's HDF5 demos (the demos are already in our LeRobot dataset).
+
+---
+
+## 3. Weights / checkpoints
+
+Set your token first (read from `/home/ubuntu/minyeong/.env`):
+
+```bash
+export HF_TOKEN=<your hf token>     # this repo reads it from ../.env
+```
+
+```bash
+cd /home/ubuntu/minyeong/dreamzero && mkdir -p checkpoints data
+
+# (a) Wan2.2-TI2V-5B backbone (~34 GB: DiT shards, Wan2.2_VAE.pth, T5 encoder, AND the umt5 tokenizer)
+hf download Wan-AI/Wan2.2-TI2V-5B --local-dir ./checkpoints/Wan2.2-TI2V-5B
+
+# (b) CLIP image encoder — Wan2.2-TI2V-5B does NOT ship it; take it from Wan2.1 (one file, ~4.5 GB)
+hf download Wan-AI/Wan2.1-I2V-14B-480P \
+    --include "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+    --local-dir ./checkpoints/Wan2.1-I2V-14B-480P
+
+# (c) umt5-xxl tokenizer files — bundled inside the Wan2.2 repo, just copy them out
+mkdir -p ./checkpoints/umt5-xxl
+cp ./checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl/* ./checkpoints/umt5-xxl/
+```
+
+**Decision:** we do **not** download the full `google/umt5-xxl` model (~50 GB). Only the tokenizer
+files (`spiece.model`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`) are
+needed, and Wan2.2-TI2V-5B already bundles them under `google/umt5-xxl/`. The T5 *encoder weights*
+come from `Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth`.
+
+### 3.1 The public DROID checkpoint (for the eval-harness test in §7.1)
+
+```bash
+# DreamZero-DROID public checkpoint (14B, Wan2.1) — skip the ~19 GB TensorRT engines
+hf download GEAR-Dreams/DreamZero-DROID --local-dir ./checkpoints/DreamZero-DROID \
+    --exclude "tensorrt/*"
+```
+
+> **Base weights for the DROID checkpoint are auto-downloaded.** The DROID checkpoint's frozen
+> modules (Wan2.1 T5 encoder, Wan2.1 VAE `z_dim=16`, CLIP, and the base DiT) are loaded at model
+> `__init__` from the paths baked into its config (`/mnt/amlfs-01/...`, which don't exist locally).
+> The action head's `ensure_file()` therefore **auto-downloads the full `Wan-AI/Wan2.1-I2V-14B-480P`
+> base (~68 GB) to the HF cache on first server start** (one-time; the checkpoint then overwrites
+> these frozen weights). This is expected and only needed for the harness test, not for the LIBERO
+> model. To pre-cache it, run `hf download Wan-AI/Wan2.1-I2V-14B-480P` beforehand.
+
+---
+
+## 4. LIBERO dataset: download + convert
+
+### 4.1 The format problem (critical)
+
+openpi's `physical-intelligence/libero` LeRobot dataset stores camera frames **inside the parquet
+files** as PNG bytes (`info.json` features `image`/`wrist_image` have `dtype: "image"`,
+`total_videos: 0`). DreamZero's loader (`ShardedLeRobotSubLangSingleActionChunkDatasetDROID`)
+reads frames from **on-disk MP4** under `videos/` via decord. So the dataset must be converted.
+
+### 4.2 Download + convert
+
+```bash
+export HF_TOKEN=<your hf token>
+hf download physical-intelligence/libero --repo-type dataset --local-dir ./data/libero_raw_lerobot
+
+# Re-encode images -> MP4, rewrite parquet without image columns, write GEAR meta/ files.
+python scripts/data/convert_libero_to_dreamzero.py \
+    --src data/libero_raw_lerobot \
+    --dst data/libero_lerobot \
+    --num-workers 64
+```
+
+`convert_libero_to_dreamzero.py` (added here):
+1. Decodes `image`/`wrist_image` and writes `videos/chunk-XXX/observation.images.{image,wrist_image}/episode_*.mp4` at the dataset fps (10), H.264 / yuv420p, exactly one frame per parquet row.
+2. Rewrites each parquet keeping `state, actions, timestamp, frame_index, episode_index, index, task_index` (drops the image columns).
+3. Writes `meta/info.json` with the two cameras as `dtype: "video"`.
+4. Writes `meta/modality.json` for `libero_sim` (see below).
+5. Computes `meta/stats.json` with **mean/std/min/max/q01/q99** for `state`+`actions` (the openpi stats only had mean/std/min/max — DreamZero's `q99` normalization needs `q99`/`q01`).
+6. Writes `meta/embodiment.json` and copies `tasks.jsonl` / `episodes.jsonl`.
+
+Result: `data/libero_lerobot/` (~11 GB), 1693 episodes, 273k frames, 28 shards.
+
+### 4.3 `modality.json` mapping (authored by the converter)
+
+```
+state  (8-dim "state" column):  eef_position[0:3], eef_rotation[3:6] (axis-angle), gripper_state[6:8]
+action (7-dim "actions" column): eef_delta[0:6],   gripper_action[6:7]
+video:  image -> observation.images.image,  wrist_image -> observation.images.wrist_image
+annotation: task -> task_index   (resolved to text via tasks.jsonl)
+```
+
+**Decision — `relative_action: false`.** LIBERO uses robosuite's `OSC_POSE` controller
+(`LIBERO/libero/libero/envs/env_wrapper.py:17`), so the recorded `actions` are *already* delta
+end-effector commands (6 delta-pose + 1 gripper). The model therefore predicts them directly; there
+is no "subtract current state" conversion (unlike DROID, which uses `relative_action: true` on
+absolute joint positions). At eval the predicted deltas are sent straight to the environment.
+
+Source / openpi parity: this comes from openpi's own LIBERO config —
+`openpi/src/openpi/training/config.py` `LeRobotLiberoDataConfig.create()` comments state *"In
+Libero, the raw actions in the dataset are already delta actions, so we do not need to apply a
+separate delta conversion"*, and `openpi/src/openpi/policies/libero_policy.py` passes `actions`
+through unchanged. **openpi is not uniform, though:** its flagship `pi05_libero` config uses
+`extra_delta_transform=False` (no conversion — same as us), while the older `pi0_libero`,
+`pi0_libero_low_mem_finetune`, `pi0_fast_libero`, and `pi0_fast_libero_low_mem_finetune` configs
+set `extra_delta_transform=True`, which applies `DeltaActions(make_bool_mask(6, -1))` — i.e. it
+*additionally* subtracts the current proprio state from the first 6 action dims (gripper left
+absolute), kept for compatibility with old Pi0 base checkpoints. DreamZero's `relative_action: true`
+is the analog of that `DeltaActions` step; we follow the cleaner **pi05** convention
+(`relative_action: false`). (With our `modality.json` key names — action `eef_delta` vs state
+`eef_position`/`eef_rotation` — `relative_action: true` wouldn't even find a matching state sub-key,
+so `false` is also the only consistent choice here.)
+
+---
+
+## 5. Code changes (the new `libero_sim` embodiment)
+
+1. **`base.yaml`**: added `libero_sim: 33` to `embodiment_tag_to_projector_index`. (Needed so
+   `collate()` / `DreamTransform` don't crash on the new embodiment. Note: `CausalWanModel`
+   hardcodes `embodiment_id=0` internally, so the index value only matters for the collate
+   language-template branch, not for separate projector weights.)
+2. **`base_48_wan_fine_aug_relative.yaml`**: added `modality_config_libero_sim` (2 video keys, 3
+   state sub-keys, 2 action sub-keys, `annotation.task`) + `transform_libero_sim` (q99 norm), and
+   registered `libero_sim` in `modality_configs`, `transforms`, `metadata_versions`, `fps`.
+3. **`libero_relative_wan22.yaml`**: new data config (160×320, `relative_action: false`,
+   `libero_data_root`, mixture spec keyed by `libero_sim`).
+4. **`dreamzero_cotrain.py`**:
+   - `collate()`: added a `LIBERO_SIM` language-template branch ("…split into two views: left =
+     agent camera, right = wrist…").
+   - `_prepare_video()`: added a `LIBERO_SIM` branch that places the 2 views **side by side**
+     `[agentview | wrist]` → `(H, 2W)`. (The action head then resizes the composite to 160×320.)
+
+`num_views=2` is passed on the training CLI.
+
+---
+
+## 6. Training (Wan2.2-5B, full fine-tune, no LoRA)
+
+```bash
+conda activate dreamzero
+cd /home/ubuntu/minyeong/dreamzero
+export HF_TOKEN=<your hf token>
+export WANDB_MODE=disabled        # or set up wandb and use REPORT_TO=wandb
+
+NUM_GPUS=8 \
+LIBERO_DATA_ROOT=$PWD/data/libero_lerobot \
+OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22 \
+PER_DEVICE_BATCH_SIZE=1 \
+MAX_STEPS=30000 \
+SAVE_STEPS=1000 SAVE_STRATEGY=steps \
+TRAIN_ARCH=full \
+PYTHON_BIN=$(which python) \
+bash scripts/train/libero_training_wan22.sh
+```
+
+> Keep `PER_DEVICE_BATCH_SIZE=1` (see §6.1 — the model only supports per-device batch 1). To grow
+> the global batch, add `training_args.gradient_accumulation_steps=N` and/or use more GPUs.
+
+Key config (set by the launcher): `data=dreamzero/libero_relative_wan22`,
+`model/dreamzero/action_head=wan_flow_matching_action_tf_wan22`, 160×320 video (latent 10×20,
+`frame_seqlen=50`), `num_frames=33`, `action_horizon=24`, `num_frame_per_block=2`,
+`num_action_per_block=24`, `num_views=2`, DeepSpeed ZeRO-2 (`groot/vla/configs/deepspeed/zero2.json`),
+`train_architecture=full`, `save_lora_only=false`.
+
+The frozen modules load from local files (no downloads): DiT base = `Wan2.2-TI2V-5B`,
+`text_encoder_pretrained_path=…/models_t5_umt5-xxl-enc-bf16.pth`,
+`image_encoder_pretrained_path=…/Wan2.1…/models_clip…pth`,
+`vae_pretrained_path=…/Wan2.2_VAE.pth`, `tokenizer_path=…/umt5-xxl`.
+
+### 6.1 Optimal batch size (measured)
+
+Full fine-tune of the 5B model with ZeRO-2 on H100 80GB:
+
+| `per_device_train_batch_size` | result |
+|---|---|
+| **1** | **works; ~46.5 GB / GPU, ~1.7 s/step** ✅ (this is the optimal/maximum) |
+| 2 | **crashes** in the action-head loss: `RuntimeError: The size of tensor a (2) must match the size of tensor b (96)` at `wan_flow_matching_action_tf.py:795` ❌ |
+
+**Conclusion: the optimal (and maximum supported) per-device batch size is `1`.** This is a model
+limitation, not a memory limit — bs=1 uses only ~46.5 GB of 80 GB, but the action-head training
+`forward` (the joint video+action flow-matching loss, e.g. `has_real_action[:, None] * action_loss_per_sample`
+and the action-register packing) assumes one sample per device. **Every official DreamZero training
+script (`droid_training*.sh`, `agibot_training.sh`, `yam_training.sh`) uses
+`per_device_train_batch_size=1`** for the same reason.
+
+To grow the **effective/global** batch size, scale the orthogonal knobs instead:
+- more data-parallel GPUs (global batch = `NUM_GPUS × 1 × grad_accum`), and/or
+- `gradient_accumulation_steps` (HF Trainer; calls the bs=1 forward N times) — e.g. add
+  `training_args.gradient_accumulation_steps=4` to the launcher overrides.
+
+Training step time ≈ 1.7 s/step (bs=1, 7 GPUs); the only slow gap is the ~20 s shard cache when
+the sharded loader moves to a new shard. `loss_log.jsonl` records `dynamics_loss` (video) and
+`action_loss`.
+
+### 6.2 Resume (verified)
+
+Resume is **automatic from `OUTPUT_DIR`** — there is no resume flag:
+- If `OUTPUT_DIR/config.json` exists → training is considered **finished** → the run exits.
+- Else if `OUTPUT_DIR/checkpoint-*` exist → it resumes from the latest (`Resuming training from …/checkpoint-N`, loading the DeepSpeed `global_step*` optimizer state).
+
+Verified here: a run was interrupted after `checkpoint-3`; rerunning the same command resumed from
+step 3, ran to step 6, saved `checkpoint-6`, and wrote the final model. To restart from scratch,
+use a fresh `OUTPUT_DIR` (or delete the old one).
+
+---
+
+## 7. Evaluation in the LIBERO simulator
+
+Two processes. **Terminal A** (GPU, `dreamzero`) runs the policy server; **Terminal B** (CPU,
+`dreamzero_libero`) runs the simulator client.
+
+### 7.0 Real eval of a LIBERO-trained model
+
+Terminal A — server:
+```bash
+conda activate dreamzero
+cd /home/ubuntu/minyeong/dreamzero
+CUDA_VISIBLE_DEVICES=1 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/dreamzero_libero_wan22 \
+    --embodiment_tag libero_sim \
+    --tokenizer_path ./checkpoints/umt5-xxl \
+    --port 8000
+```
+
+Terminal B — client (sim):
+```bash
+conda activate dreamzero_libero
+cd /home/ubuntu/minyeong/dreamzero
+MUJOCO_GL=egl python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8000 \
+    --task-suite-name libero_spatial \
+    --num-trials-per-task 50 \
+    --video-out-path ./eval_outputs/libero_spatial/videos
+```
+
+Outputs (like `openpi/examples/libero/main.py`, plus a metrics file):
+- per-episode rollout MP4s under `--video-out-path` (named `…_success.mp4` / `…_failure.mp4`),
+- `eval_outputs/libero_spatial/metrics.json` with per-task and overall success rates (written
+  incrementally so a crash leaves partial results).
+
+Task suites: `libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`.
+
+### 7.1 Eval-harness smoke test with the public DreamZero-DROID checkpoint (verified)
+
+This proves the eval pipeline end-to-end **before** a LIBERO model is trained, using the public
+14B DROID checkpoint as a stand-in. The DROID checkpoint is a **different embodiment** (3 views,
+joint-position actions), so the server adapts LIBERO obs to the DROID format (agentview duplicated
+into the 2 exterior views; 8-dim state mapped into joint(7)+gripper(1)). **Actions are therefore
+meaningless for LIBERO → success ≈ 0**; the point is to verify connection → obs → action →
+sim → video/metrics.
+
+Terminal A — server (`--embodiment_tag oxe_droid`):
+```bash
+conda activate dreamzero
+cd /home/ubuntu/minyeong/dreamzero
+CUDA_VISIBLE_DEVICES=1 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/DreamZero-DROID \
+    --embodiment_tag oxe_droid \
+    --tokenizer_path ./checkpoints/umt5-xxl \
+    --port 8000
+```
+(On first start this auto-downloads the Wan2.1 base ~68 GB to the HF cache — see §3.1 — and the
+14B model load takes a few minutes.)
+
+Terminal B — client:
+```bash
+conda activate dreamzero_libero
+cd /home/ubuntu/minyeong/dreamzero
+MUJOCO_GL=egl python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8000 --task-suite-name libero_spatial \
+    --max-tasks 1 --num-trials-per-task 2 --max-steps-override 60 \
+    --video-out-path ./eval_outputs/harness_droid/videos
+```
+Verified result: 2 episodes ran, rollout MP4s + `metrics.json` written, overall success 0.0
+(expected for the wrong embodiment). First inference on the 14B model warms up for a few minutes;
+subsequent ones are ~3 s.
+
+### 7.2 Eval observation details (must match training)
+
+The client mirrors `openpi/examples/libero/main.py`:
+- **180° rotation** of both camera images (`obs[...][::-1, ::-1]`) to match how the LIBERO demos
+  (and hence our LeRobot dataset) are oriented.
+- 8-dim state = `concat(eef_pos(3), quat2axisangle(eef_quat)(3), gripper_qpos(2))`.
+- `replan_steps=5` (execute 5 of the returned action chunk before re-querying).
+- A per-episode `session_id`; on a new `session_id` the server resets the action head's causal
+  KV-cache (`current_start_frame=0`).
+
+Protocol note: this uses **DreamZero's** websocket protocol (`eval_utils/policy_client.py`, which
+sends an `endpoint` field and supports `reset`), **not** openpi's `websocket_client_policy`
+(openpi's server has no `endpoint`/`reset`). The server returns `{"actions": (N, 7)}`.
+
+---
+
+## 8. Critical decisions / gotchas (summary)
+
+1. **Two envs, by design.** Eval is client–server; the LIBERO sim env (old robosuite/mujoco/gym,
+   py3.10) is kept separate from the training/serving env (torch 2.8 / py3.11). A unified env is
+   not practical and not needed.
+2. **LIBERO data must be re-encoded to MP4.** `physical-intelligence/libero` stores images in
+   parquet; DreamZero reads MP4. Use `convert_libero_to_dreamzero.py`.
+3. **`relative_action: false` for LIBERO** (actions are already deltas).
+4. **2 views, side-by-side** composite; `num_views=2`; new `collate()` + `_prepare_video()`
+   branches for `LIBERO_SIM`.
+5. **Stats need q01/q99**; the converter recomputes them (openpi's stats lacked them).
+6. **`libero_sim: 33`** added to the projector-index map (only used by the collate language
+   template; the DiT forces `embodiment_id=0`).
+7. **umt5 tokenizer is bundled in Wan2.2-TI2V-5B**; no separate 50 GB download.
+8. **Resume is automatic from `OUTPUT_DIR`**; a top-level `config.json` means "finished" (use a
+   fresh dir to retrain).
+9. **GPU 0 was busy** during this work → trained/evaled on GPUs 1–7. Use `NUM_GPUS=8` on a free
+   node.
+10. **DROID-checkpoint eval is a harness test only** (wrong embodiment → ~0 success).
+
+---
+
+## 9. Reproduction checklist
+
+```text
+[ ] conda env `dreamzero` (py3.11, pip install -e . cu129, flash-attn)           # §2.1
+[ ] conda env `dreamzero_libero` (py3.10, robosuite/mujoco/gym + LIBERO + client) # §2.2
+[ ] ~/.libero/config.yaml                                                          # §2.2
+[ ] download Wan2.2-TI2V-5B, Wan2.1 CLIP, copy umt5 tokenizer                      # §3
+[ ] (for harness test) download DreamZero-DROID + Wan2.1 T5/VAE                    # §3.1
+[ ] hf download physical-intelligence/libero (dataset)                            # §4.2
+[ ] python scripts/data/convert_libero_to_dreamzero.py                            # §4.2
+[ ] bash scripts/train/libero_training_wan22.sh  (TRAIN_ARCH=full)               # §6
+[ ] verify resume (rerun same OUTPUT_DIR)                                         # §6.2
+[ ] serve_dreamzero_libero.py + run_libero_eval.py                               # §7
+```

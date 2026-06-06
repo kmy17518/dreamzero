@@ -164,7 +164,13 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
-            batch[key] = torch.from_numpy(np.stack(values))
+            try:
+                batch[key] = torch.from_numpy(np.stack(values))
+            except ValueError as e:
+                shapes = [np.asarray(v).shape for v in values]
+                raise ValueError(
+                    f"[collate] np.stack failed for key '{key}': per-sample shapes={shapes}"
+                ) from e
     return batch
 
 

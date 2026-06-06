@@ -135,6 +135,7 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        enforce_full_chunks: bool = False,
     ):
         """
         Initialize the dataset.
@@ -173,6 +174,11 @@ class LeRobotSingleDataset(Dataset):
         self.discard_bad_trajectories = discard_bad_trajectories
         self.relative_action = relative_action
         self.relative_action_per_horizon = relative_action_per_horizon
+        # When True, only yield samples whose video/state/action all reach the full
+        # max_chunk_size window, so every sample has identical shapes. Required for
+        # per-device batch size > 1 (the collate stacks samples and cannot mix sizes).
+        # Boundary samples that fall short are skipped (get_step_data -> None -> not yielded).
+        self.enforce_full_chunks = enforce_full_chunks
         # Determine which action keys should use relative action
         if relative_action_keys is not None:
             self.relative_action_keys = relative_action_keys

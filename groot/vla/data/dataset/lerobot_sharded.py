@@ -847,6 +847,11 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # print("sampled indices for state", sampled_indices)
 
+        # Enforce fixed-size samples for per-device batch size > 1: skip if fewer than the full
+        # max_chunk_size anchors were collected (empty -> get_step_data None -> sample skipped).
+        if getattr(self, "enforce_full_chunks", False) and len(sampled_indices) < self.max_chunk_size:
+            return np.array([])
+
         # Pad the data using the computed sampled indices
         return self.retrieve_data_and_pad(
             array=data_array,
@@ -1024,6 +1029,11 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             sampled_indices = np.minimum(sampled_indices, trajectory_length - 1)
         
         # print("sampled indices for action", first_idx, sampled_indices, trajectory_length)
+
+        # Enforce fixed-size samples for per-device batch size > 1: skip if fewer than the full
+        # 24 * max_chunk_size action steps were collected (empty -> get_step_data None -> skipped).
+        if getattr(self, "enforce_full_chunks", False) and len(sampled_indices) < 24 * self.max_chunk_size:
+            return np.array([])
 
         # Pad the data using the computed sampled indices
         action_data = self.retrieve_data_and_pad(
@@ -1228,7 +1238,13 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # ensure that unique_sorted has 4n+1 frames
         assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 4n+1"
-        
+
+        # Enforce fixed-size samples (needed for per-device batch size > 1): skip boundary samples
+        # that did not reach the full max_chunk_size window so all yielded samples share one shape.
+        # Returning empty -> get_step_data() returns None -> sample is not yielded.
+        if getattr(self, "enforce_full_chunks", False) and unique_sorted.size < max_frames:
+            return np.array([], dtype=int)
+
         # Store the number of chunks for alignment with action/state
         num_video_chunks = (unique_sorted.size - 1) // 8
         if not hasattr(self, '_current_num_chunks'):

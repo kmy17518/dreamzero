@@ -51,6 +51,9 @@ train_dataset:
     relative_action: ${relative_action}
     relative_action_keys: ${relative_action_keys}
     relative_action_per_horizon: ${relative_action_per_horizon}
+    # Yield only full max_chunk_size samples so per-device batch size > 1 can stack them
+    # (LIBERO boundary samples otherwise vary in #chunks -> np.stack collate failure).
+    enforce_full_chunks: true
   mixture_kwargs:
     training: true
     balance_dataset_weights: false

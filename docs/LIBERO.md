@@ -805,37 +805,45 @@ OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_action_loss_only S
 
 ---
 
-# 12. Action-loss-only + observation-only attention variant (action attends to current obs, NOT future video)
+# 12. Action-loss-only + skip-noisy-video attention variant (action conditions on the clean video stream, NOT the block being denoised)
 
 This builds on the action-loss-only variant (§11). In addition to optimizing **only** `train/action_loss`,
-it changes the **attention mask** so the action/state register attends **only to the clean current
-observation (the first video frame) + its own action+state register** — and **not** the to-be-generated
-future video blocks. CLIP image conditioning (cross-attention) and proprio state are unchanged. The
+it changes the **attention mask** so the action/state register attends to the **clean video stream** (the
+first frame = current observation **+ the clean context blocks = the causal video history**) **+ its own
+action+state register**, but **not** the **noisy video block currently being denoised** (the
+video-denoising target). CLIP image conditioning (cross-attention) and proprio state are unchanged. The
 optimized loss is still action-only (this config inherits §11's `action_loss_only: true`), so **both**
 flags are on.
 
-**Why.** With the dynamics loss off (§11), the video stream is no longer trained to denoise, yet the
-action register still attends to it. That creates a **train/inference mismatch**: at training the action
-tokens attend to the *noised ground-truth* future frames (teacher forcing — an oracle peek), while at
-inference they would attend to a *self-generated* rollout produced by a video model that was never
-trained. Cutting the action→future-video attention removes the mismatch while keeping visual
-conditioning (first frame + CLIP). If this run's eval `success_rate` beats plain action-loss-only at
-similar `train/action_loss`, that's the mismatch fix paying off.
+> Note: this **supersedes** an earlier "obs-only / frame-0-only" attempt (`action_attend_obs_only`) that
+> also dropped the clean context blocks beyond frame 0. That was too aggressive — the clean video history
+> is legitimate conditioning and is kept here. Only the **noisy/denoised** block is dropped.
 
-**What was added** — gated behind a new flag (default **off**, so the §6/§10/§11 paths are byte-for-byte
+**Why.** With the dynamics loss off (§11), the video-denoising output is no longer trained, yet the action
+register still attends to that **noisy/denoised block**. That creates a **train/inference mismatch**: at
+train it attends to the *noised ground-truth* block (an oracle peek); at inference it would attend to an
+*untrained, self-generated* block. Cutting **only that edge** removes the dependence on the
+video-denoising output while keeping the **clean video history** (+ CLIP + proprio state) as conditioning.
+
+**What was added** — gated behind a flag (default **off**, so the §6/§10/§11 paths are byte-for-byte
 unaffected). All on the `libero_al_only` branch:
 
 | Area | File / change |
 |---|---|
-| Attention gate | `groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py` — new `CausalWanModel` ctor arg `action_attend_obs_only` (default `false`), threaded `CausalWanModel → CausalWanAttentionBlock → CausalWanSelfAttention`. When true the action/state register drops every video token **except the first frame** in all active paths: teacher-forcing training (`_process_noisy_action_blocks`), the non-TF flash path (`_blockwise_causal_flash_attn`), and the streaming inference KV-cache path (captures frame 0 *before* cache truncation). The mask visualizer is updated to match. Image-stream self-attention and CLIP cross-attention are untouched. |
-| Action-head config | `groot/vla/configs/model/dreamzero/action_head/wan_flow_matching_action_tf_wan22_action_loss_only_obs_attn.yaml` (inherits `..._action_loss_only`, sets `diffusion_model_cfg.action_attend_obs_only: true`). |
-| Training launcher | `scripts/train/libero_training_wan22_action_loss_only_obs_attn.sh` (selects the new head; separate default `OUTPUT_DIR`; sets `PYTHONPATH=$DREAMZERO_ROOT` like §11). |
-| Sanity test | `scripts/test_action_obs_attn.py` (CPU, no GPU). |
+| Attention gate | `groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py` — new `CausalWanModel` ctor arg `action_skip_noisy_video` (default `false`), threaded `CausalWanModel → CausalWanAttentionBlock → CausalWanSelfAttention`. When true the action/state register drops **only the noisy video block** (keeps the clean video stream) in all active paths: teacher-forcing training (`_process_noisy_action_blocks` → keeps `clean_image[:, :clean_end]`, drops `noisy_image[i]`), the non-TF flash path (`_blockwise_causal_flash_attn` → previous image blocks only, excludes the current block), and the streaming inference KV-cache path (action register attends to the KV cache = clean history, drops the current noisy block `roped_key`). The mask visualizer matches. Image-stream self-attention and CLIP cross-attention are untouched. |
+| Action-head config | `groot/vla/configs/model/dreamzero/action_head/wan_flow_matching_action_tf_wan22_action_loss_only_skip_noisy_video.yaml` (inherits `..._action_loss_only`, sets `diffusion_model_cfg.action_skip_noisy_video: true`). |
+| Training launcher | `scripts/train/libero_training_wan22_action_loss_only_skip_noisy_video.sh` (selects the new head; separate default `OUTPUT_DIR`; sets `PYTHONPATH=$DREAMZERO_ROOT` like §11). |
+| Sanity test | `scripts/test_action_skip_noisy_video.py` (CPU, no GPU). |
+
+> **Functional note.** For the resulting action policy this is **equivalent** to fully removing the
+> noisy-video/dynamics task from the forward: since the action no longer attends to the noisy block **and**
+> the dynamics loss is ×0, that subgraph is detached from the action's gradient. Keeping it (vs. removing
+> it) just preserves the `dynamics_loss` logging + the architecture/inference intact, at the cost of the
+> (now-unused) video forward's compute.
 
 > **Inference note.** The streaming KV-cache is bounded by `local_attn_size = max_chunk_size·num_frame_per_block + 1 = 9`
-> frames, and `current_start_frame` resets to 0 every 9 frames, re-seeding frame 0 with the current
-> observation. The action register attends to that frame-0 KV (captured before truncation), so "first
-> frame" == current observation at inference too.
+> frames and re-seeds frame 0 with the current obs every 9 frames; the action register attends to that
+> cache (the previously-denoised frames = the clean history), not the block being denoised this step.
 
 ## 12.1 Train
 
@@ -848,7 +856,7 @@ env-prefixed launcher as ONE line.** Pick a **unique** `WANDB_RUN_ID` / `OUTPUT_
 source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero
 cd /root/dreamzero && set -a; . ./.env; set +a
 
-WANDB_RUN_ID=dreamzero_libero_wan22_action_loss_only_obs_attn_v2 NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 SAVE_TOTAL_LIMIT=100000 OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22_action_loss_only_obs_attn_v2 LIBERO_DATA_ROOT=$PWD/data/libero_lerobot PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=100000 SAVE_STEPS=1000 SAVE_STRATEGY=steps TRAIN_ARCH=full PYTHON_BIN=$(which python) bash scripts/train/libero_training_wan22_action_loss_only_obs_attn.sh
+WANDB_RUN_ID=dreamzero_libero_wan22_action_loss_only_skip_noisy_video_v1 NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 SAVE_TOTAL_LIMIT=100000 OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22_action_loss_only_skip_noisy_video_v1 LIBERO_DATA_ROOT=$PWD/data/libero_lerobot PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=100000 SAVE_STEPS=1000 SAVE_STRATEGY=steps TRAIN_ARCH=full PYTHON_BIN=$(which python) bash scripts/train/libero_training_wan22_action_loss_only_skip_noisy_video.sh
 ```
 
 - `NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6` trains on GPUs 0–6 and leaves **GPU 7 for the eval
@@ -857,41 +865,41 @@ WANDB_RUN_ID=dreamzero_libero_wan22_action_loss_only_obs_attn_v2 NUM_GPUS=7 CUDA
   `training_args.gradient_accumulation_steps=N` and/or more GPUs.
 - **Sanity-check it's really this variant:** the launcher prints `Using PYTHONPATH: /root/dreamzero`;
   the saved config (`OUTPUT_DIR/wandb/latest-run/logs/debug.log`, or `experiment_cfg/`) shows **both**
-  `'action_loss_only': True` and `'action_attend_obs_only': True`; in wandb `train/loss == train/action_loss`.
+  `'action_loss_only': True` and `'action_skip_noisy_video': True`; in wandb `train/loss == train/action_loss`.
 - **Resume** is automatic from `OUTPUT_DIR` (§6.2/§10.6).
 
 ## 12.2 Eval
 
-`action_attend_obs_only` is baked into the model config, so eval uses the **standard** path (§7/§10.5)
+`action_skip_noisy_video` is baked into the model config, so eval uses the **standard** path (§7/§10.5)
 or the watcher (§10.4) pointed at this checkpoint — no extra flags. Use a **distinct**
 `--port` / `--video-out-path` / `UPLOAD_REPO` from any concurrent run. Watcher (GPU 7), alongside
 training, logs to a sibling `<run>-eval` run in the same `dreamzero_libero` project:
 
 ```bash
-OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_action_loss_only_obs_attn_v2 SERVER_GPU=7 TRIALS=3 KEEP_BEST=3 KEEP_LATEST=3 UPLOAD_REPO=<your-hf-user>/dreamzero-libero-action-loss-only-obs-attn-best-v2 bash /root/dreamzero/scripts/eval/watch_eval_libero.sh --wandb-run-id dreamzero_libero_wan22_action_loss_only_obs_attn_v2
+OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_action_loss_only_skip_noisy_video_v1 SERVER_GPU=7 TRIALS=3 KEEP_BEST=3 KEEP_LATEST=3 UPLOAD_REPO=<your-hf-user>/dreamzero-libero-action-loss-only-skip-noisy-video-best-v1 bash /root/dreamzero/scripts/eval/watch_eval_libero.sh --wandb-run-id dreamzero_libero_wan22_action_loss_only_skip_noisy_video_v1
 ```
 
 ## 12.3 Verify the attention change (CPU, no GPU, no checkpoint needed)
 
 ```bash
 conda activate dreamzero && cd /root/dreamzero
-CUDA_VISIBLE_DEVICES="" ATTENTION_BACKEND=torch python scripts/test_action_obs_attn.py   # -> ALL CHECKS PASSED
+CUDA_VISIBLE_DEVICES="" ATTENTION_BACKEND=torch python scripts/test_action_skip_noisy_video.py   # -> ALL CHECKS PASSED
 ```
 
 Asserts, for **both** the training (`_process_noisy_action_blocks`) and inference (KV-cache) paths:
-with the flag **on**, the action/state register output is *exactly* invariant to future-video tokens
-but still depends on the first frame (current obs); with the flag **off** (default), it depends on the
-future video (i.e. existing behavior is unchanged). Also checks the `CausalWanModel → block → self_attn`
-threading.
+with the flag **on**, the action/state register output is *exactly* invariant to the **noisy video block**
+but still depends on the **clean video context** (first frame + clean context blocks / KV-cache history);
+with the flag **off** (default), it depends on the noisy block (existing behavior unchanged). Also checks
+the `CausalWanModel → block → self_attn` threading.
 
-## 12.4 Reproduction checklist (action-loss-only + obs-attn)
+## 12.4 Reproduction checklist (action-loss-only + skip-noisy-video)
 
 ```text
-[ ] branch libero_al_only; conda activate dreamzero; cd /root/dreamzero; set -a; . ./.env; set +a    # §12.1
-[ ] train via scripts/train/libero_training_wan22_action_loss_only_obs_attn.sh (single line)          # §12.1
-[ ]   distinct WANDB_RUN_ID + OUTPUT_DIR + UPLOAD_REPO (...obs_attn[_v2]); wandb project dreamzero_libero
-[ ]   GPUs 0-6 train (NUM_GPUS=7), GPU7 watcher; PER_DEVICE_BATCH_SIZE=1                              # §12.1
-[ ]   sanity: config has action_loss_only:true AND action_attend_obs_only:true; train/loss==train/action_loss
-[ ] eval watcher (§10.4) / manual (§10.5) on the ...obs_attn checkpoint; distinct port/repo           # §12.2
-[ ] python scripts/test_action_obs_attn.py -> ALL CHECKS PASSED                                        # §12.3
+[ ] branch libero_al_only; conda activate dreamzero; cd /root/dreamzero; set -a; . ./.env; set +a          # §12.1
+[ ] train via scripts/train/libero_training_wan22_action_loss_only_skip_noisy_video.sh (single line)        # §12.1
+[ ]   distinct WANDB_RUN_ID + OUTPUT_DIR + UPLOAD_REPO (...skip_noisy_video[_v1]); project dreamzero_libero
+[ ]   GPUs 0-6 train (NUM_GPUS=7), GPU7 watcher; PER_DEVICE_BATCH_SIZE=1                                    # §12.1
+[ ]   sanity: config has action_loss_only:true AND action_skip_noisy_video:true; train/loss==train/action_loss
+[ ] eval watcher (§10.4) / manual (§10.5) on the ...skip_noisy_video checkpoint; distinct port/repo         # §12.2
+[ ] python scripts/test_action_skip_noisy_video.py -> ALL CHECKS PASSED                                     # §12.3
 ```

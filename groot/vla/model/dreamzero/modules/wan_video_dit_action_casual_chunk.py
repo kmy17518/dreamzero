@@ -198,7 +198,7 @@ class CausalWanSelfAttention(nn.Module):
                  eps=1e-6,
                  num_action_per_block=32,
                  num_state_per_block=1,
-                 action_attend_obs_only=False):
+                 action_skip_noisy_video=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -213,9 +213,11 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_seqlen = frame_seqlen
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
-        # Ablation flag: when True, action/state register attends only to the clean current
-        # observation (first frame) + its own register, NOT the to-be-generated video blocks.
-        self.action_attend_obs_only = action_attend_obs_only
+        # Ablation flag: when True, the action/state register attends to the CLEAN video stream
+        # (first frame + clean context blocks) + its own register, but NOT the noisy video block
+        # currently being denoised. Removes the action's dependence on the (untrained) video
+        # prediction while keeping the clean rollout history as context.
+        self.action_skip_noisy_video = action_skip_noisy_video
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -284,14 +286,16 @@ class CausalWanSelfAttention(nn.Module):
             # Attend to first image
             mask[action_block_start:action_block_end, first_image_start:first_image_end] = True
             
-            # Attend to previous and current image blocks (skipped when obs-only ablation is on)
-            if not self.action_attend_obs_only:
-                image_block_end = image_blocks_start + (block_idx + 1) * num_frame_per_block * frame_seqlen
-                if self.local_attn_size != -1:
-                    image_kv_start = max(image_blocks_start, image_block_end - self.local_attn_size * frame_seqlen)
-                else:
-                    image_kv_start = image_blocks_start
-                mask[action_block_start:action_block_end, image_kv_start:image_block_end] = True
+            # Attend to previous image blocks; include the CURRENT (noisy) block only when the
+            # skip-noisy-video ablation is OFF.
+            image_block_start_i = image_blocks_start + block_idx * num_frame_per_block * frame_seqlen
+            image_block_end = image_blocks_start + (block_idx + 1) * num_frame_per_block * frame_seqlen
+            if self.local_attn_size != -1:
+                image_kv_start = max(image_blocks_start, image_block_end - self.local_attn_size * frame_seqlen)
+            else:
+                image_kv_start = image_blocks_start
+            attend_end = image_block_start_i if self.action_skip_noisy_video else image_block_end
+            mask[action_block_start:action_block_end, image_kv_start:attend_end] = True
             
             # Self-attention
             mask[action_block_start:action_block_end, action_block_start:action_block_end] = True
@@ -527,15 +531,19 @@ class CausalWanSelfAttention(nn.Module):
                 image_kv_start = image_blocks_start
             
             # Build context
-            if self.action_attend_obs_only:
-                # Ablation: action attends only to first image (current obs) + own action/state.
+            if self.action_skip_noisy_video:
+                # Action attends to first image + the PREVIOUS (clean context) image blocks, but
+                # NOT the current image block being predicted; + own action/state.
+                prev_image_end = image_block_starts[block_idx]  # exclude current block i's image
                 k_context = torch.cat([
                     k[:, first_image_start:first_image_end],  # First image (current obs)
+                    k[:, image_kv_start:prev_image_end],  # Previous image blocks (context)
                     k[:, action_block_start:action_block_end],  # Current action block
                     k[:, state_block_start:state_block_end]  # Current state block
                 ], dim=1)
                 v_context = torch.cat([
                     v[:, first_image_start:first_image_end],
+                    v[:, image_kv_start:prev_image_end],
                     v[:, action_block_start:action_block_end],
                     v[:, state_block_start:state_block_end]
                 ], dim=1)
@@ -783,18 +791,19 @@ class CausalWanSelfAttention(nn.Module):
             
             q_block = noisy_action_q[:, action_start:action_end]
             
-            if self.action_attend_obs_only:
-                # Ablation: action attends ONLY to the clean current observation (first frame)
-                # + its own action/state register. Drops all future video (clean teacher-forced
-                # blocks AND the current noisy image block) -> removes the train/inference
-                # mismatch that arises when the video (dynamics) loss is not optimized.
+            if self.action_skip_noisy_video:
+                # Action attends to the CLEAN video stream (first frame + clean context blocks
+                # 0..i-1, i.e. clean_image_k[:, :clean_end]) + its own action/state register, but
+                # NOT the noisy video block being denoised (noisy_image[i]). Removes the action's
+                # dependence on the (untrained) video-denoising output while keeping the clean
+                # rollout history as context.
                 k_context = torch.cat([
-                    clean_image_k[:, :self.frame_seqlen],
+                    clean_image_k[:, :clean_end],
                     noisy_action_k[:, action_start:action_end],
                     noisy_state_k[:, state_start:state_end]
                 ], dim=1)
                 v_context = torch.cat([
-                    clean_image_v[:, :self.frame_seqlen],
+                    clean_image_v[:, :clean_end],
                     noisy_action_v[:, action_start:action_end],
                     noisy_state_v[:, state_start:state_end]
                 ], dim=1)
@@ -1098,35 +1107,35 @@ class CausalWanSelfAttention(nn.Module):
             updated_kv_cache = kv_cache
             updated_k = updated_kv_cache[0]
             updated_v = updated_kv_cache[1]
+            # The existing KV cache (updated_k/v) is the CLEAN context: previously denoised frames,
+            # incl. frame 0 (the cache is reseeded with the current obs as frame 0 every
+            # `local_attn_size` frames). `roped_key`/`v` are the CURRENT noisy video block being
+            # denoised this step.
+            context_k = updated_k
+            context_v = updated_v
             # Assign new keys/values directly up to current_end
             new_k = torch.cat([updated_k, roped_key], dim=1)
             new_v = torch.cat([updated_v, v], dim=1)
-
-            # Capture the first frame (clean current observation) BEFORE truncation so the action
-            # register can attend to it even if the rolling KV cache later evicts it. The video
-            # KV cache is reseeded with the current obs as frame 0 every `local_attn_size` frames
-            # (see the current_start_frame reset), so this is the current observation.
-            obs_k = new_k[:, :self.frame_seqlen]
-            obs_v = new_v[:, :self.frame_seqlen]
 
             # We may need to truncate the KV cache if it's size is larger than the max attention size.
             new_k = new_k[:, -self.max_attention_size:]
             new_v = new_v[:, -self.max_attention_size:]
 
             if action_register_length is not None:
-                if self.action_attend_obs_only:
+                if self.action_skip_noisy_video:
                     # Image stream: unchanged (attends to the rolling video cache + action register).
                     x_img = self.attn(
                         roped_query,
                         torch.cat([new_k, roped_action_key], dim=1),
                         torch.cat([new_v, action_v], dim=1),
                     )
-                    # Action/state register: attend ONLY to the clean current observation (first
-                    # frame) + its own register. No generated/future video tokens.
+                    # Action/state register: attend to the CLEAN context (the KV cache = previously
+                    # denoised frames, incl. frame 0) + its own register, but NOT the current noisy
+                    # video block being denoised (roped_key/v).
                     x_act = self.attn(
                         roped_action_query,
-                        torch.cat([obs_k, roped_action_key], dim=1),
-                        torch.cat([obs_v, action_v], dim=1),
+                        torch.cat([context_k, roped_action_key], dim=1),
+                        torch.cat([context_v, action_v], dim=1),
                     )
                     x = torch.cat([x_img, x_act], dim=1)
                 else:
@@ -1166,7 +1175,7 @@ class CausalWanAttentionBlock(nn.Module):
                  eps=1e-6,
                  num_action_per_block=32,
                  num_state_per_block=1,
-                 action_attend_obs_only=False):
+                 action_skip_noisy_video=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1189,7 +1198,7 @@ class CausalWanAttentionBlock(nn.Module):
             eps=eps,
             num_action_per_block=num_action_per_block,
             num_state_per_block=num_state_per_block,
-            action_attend_obs_only=action_attend_obs_only,
+            action_skip_noisy_video=action_skip_noisy_video,
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -1350,7 +1359,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  num_action_per_block=32,
                  num_state_per_block=1,
                  concat_first_frame_latent=True,
-                 action_attend_obs_only=False):
+                 action_skip_noisy_video=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1421,9 +1430,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.concat_first_frame_latent = concat_first_frame_latent
-        # Ablation: action/state register attends only to the clean current observation (first
-        # frame) + own register, not the (untrained, to-be-generated) future video blocks.
-        self.action_attend_obs_only = action_attend_obs_only
+        # Ablation: action/state register attends to the clean video stream (first frame + clean
+        # context blocks) + own register, but NOT the noisy video block being denoised.
+        self.action_skip_noisy_video = action_skip_noisy_video
 
         max_num_embodiments = 1
 
@@ -1462,7 +1471,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, frame_seqlen,
                                     self.local_attn_size, sink_size, num_frame_per_block, qk_norm, cross_attn_norm, eps,
-                                    num_action_per_block, num_state_per_block, action_attend_obs_only)
+                                    num_action_per_block, num_state_per_block, action_skip_noisy_video)
             for _ in range(num_layers)
         ])
 

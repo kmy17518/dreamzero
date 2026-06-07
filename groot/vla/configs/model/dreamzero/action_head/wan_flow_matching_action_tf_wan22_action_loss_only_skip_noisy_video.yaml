@@ -1,0 +1,27 @@
+# @package _global_
+# Action-loss-only + "skip noisy video" attention ablation of the Wan2.2-TI2V-5B action head.
+#
+# Builds on wan_flow_matching_action_tf_wan22_action_loss_only (ONLY the action flow-matching loss
+# is optimized; the video/dynamics loss is logged but contributes no gradient) and ADDITIONALLY
+# changes the attention mask so the action/state register attends to:
+#   - the CLEAN video stream (first frame = current observation + the clean context blocks, i.e. the
+#     causal video history), and
+#   - its own action+state register,
+# but NOT the noisy video block currently being denoised (the video-denoising target).
+#
+# Rationale: with the dynamics loss off, the video-denoising output is untrained. Keeping the
+# action attending to that noisy/denoised block creates a train/inference mismatch (at train it
+# peeks at the noised ground-truth future; at inference it would attend to an untrained
+# self-generated block). Cutting only that edge removes the dependence on the video-denoising
+# output while keeping the clean video history (+ CLIP cross-attention + proprio state) as context.
+# CLIP image features are injected via cross-attention and are unaffected by this flag.
+#
+# Select with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_action_loss_only_skip_noisy_video
+
+defaults:
+  - wan_flow_matching_action_tf_wan22_action_loss_only
+
+action_head_cfg:
+  config:
+    diffusion_model_cfg:
+      action_skip_noisy_video: true

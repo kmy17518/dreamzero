@@ -1,16 +1,16 @@
 #!/bin/bash
 # DreamZero LIBERO training with the Wan2.2-TI2V-5B backbone (full or LoRA finetune).
 #
-# ACTION-LOSS-ONLY + OBS-ATTENTION VARIANT: like libero_training_wan22_action_loss_only.sh
+# ACTION-LOSS-ONLY + SKIP-NOISY-VIDEO VARIANT: like libero_training_wan22_action_loss_only.sh
 # (optimizes ONLY the action flow-matching loss; the video dynamics loss is logged but gets no
-# gradient) AND additionally restricts the action/state register to attend only to the clean
-# current observation (first frame) + its own register -- NOT the to-be-generated future video
-# blocks. This removes the train/inference mismatch that arises when the video loss is not trained.
-# Everything else is identical; it defaults to its own OUTPUT_DIR so it never collides with the
-# joint-loss or plain action-loss-only runs.
+# gradient) AND additionally changes the attention mask so the action/state register attends to the
+# CLEAN video stream (first frame + clean context blocks = the causal video history) + its own
+# register, but NOT the noisy video block being denoised. This removes the action's dependence on
+# the (untrained) video-denoising output while keeping the clean video history as context.
+# It defaults to its own OUTPUT_DIR so it never collides with the other runs.
 #
 # Usage:
-#   bash scripts/train/libero_training_wan22_action_loss_only_obs_attn.sh
+#   bash scripts/train/libero_training_wan22_action_loss_only_skip_noisy_video.sh
 #
 # Prerequisites (identical to libero_training_wan22.sh):
 #   - LIBERO dataset converted to DreamZero/GEAR LeRobot format at LIBERO_DATA_ROOT
@@ -41,7 +41,7 @@ fi
 # IMPORTANT: this repo copy ($DREAMZERO_ROOT) may differ from the `pip install -e .` editable
 # `groot`. torch.distributed.run workers do NOT put cwd on sys.path, so without this they import
 # the editable `groot` and would silently miss the code in THIS copy (e.g. the action_loss_only /
-# action_attend_obs_only gating) -> it would train the wrong objective. Prepend this repo so
+# action_skip_noisy_video gating) -> it would train the wrong objective. Prepend this repo so
 # workers import `groot` from here.
 export PYTHONPATH="$DREAMZERO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 echo "Using PYTHONPATH: $PYTHONPATH"
@@ -49,8 +49,8 @@ echo "Using PYTHONPATH: $PYTHONPATH"
 # ============ USER CONFIGURATION ============
 NUM_GPUS=${NUM_GPUS:-8}
 LIBERO_DATA_ROOT=${LIBERO_DATA_ROOT:-"$DREAMZERO_ROOT/data/libero_lerobot"}
-# Separate default OUTPUT_DIR so this run never collides with the joint-loss / action-loss-only runs.
-OUTPUT_DIR=${OUTPUT_DIR:-"$DREAMZERO_ROOT/checkpoints/dreamzero_libero_wan22_action_loss_only_obs_attn"}
+# Separate default OUTPUT_DIR so this run never collides with the other runs.
+OUTPUT_DIR=${OUTPUT_DIR:-"$DREAMZERO_ROOT/checkpoints/dreamzero_libero_wan22_action_loss_only_skip_noisy_video"}
 
 # Training scale: per-GPU batch size, max steps, and architecture (full|lora).
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
@@ -97,7 +97,7 @@ cd "$DREAMZERO_ROOT"
     action_horizon=24 \
     num_views=2 \
     model=dreamzero/vla \
-    model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_action_loss_only_obs_attn \
+    model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_action_loss_only_skip_noisy_video \
     model/dreamzero/transform=dreamzero_cotrain \
     num_frame_per_block=2 \
     num_action_per_block=24 \

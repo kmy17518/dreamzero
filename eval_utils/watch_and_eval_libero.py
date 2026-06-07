@@ -436,14 +436,20 @@ def main():
     def sync_uploads(best_steps):
         if uploader is None:
             return
-        best_set = set(best_steps)
-        for s in best_steps:
+        # HF mirror = best-N (by success rate) UNION the latest complete checkpoint, so the most
+        # recent training state is always resumable from the Hub even before it is (or if it never
+        # becomes) a top scorer. Anything previously uploaded that is no longer in this set is removed.
+        upload_set = set(best_steps)
+        complete = [s for s, _ in find_complete_checkpoints(output_dir)]
+        if complete:
+            upload_set.add(max(complete))
+        for s in sorted(upload_set):
             if s in uploaded:
                 continue
             src = os.path.join(output_dir, f"checkpoint-{s}")
             if os.path.isdir(src):
                 uploader.enqueue("up", s, src)
-        for s in sorted(uploaded - best_set):
+        for s in sorted(uploaded - upload_set):
             uploader.enqueue("del", s)
 
     try:

@@ -211,19 +211,33 @@ automatic watcher and standalone eval work with **no extra flags**.
 
 Same as `LIBERO.md` §10.4 — point it at the explicit‑conditioning `OUTPUT_DIR`. The watcher starts
 the policy server (which auto‑primes), runs the sim eval per new `checkpoint-N`, logs
-`eval/success_rate` to a sibling `<run>-eval` wandb run, retains `latest‑N ∪ best‑M`, and optionally
-mirrors best‑M to the Hub. No change is required for explicit conditioning.
+`eval/success_rate` to a sibling `<run>-eval` wandb run, retains `latest‑N ∪ best‑M` **locally**, and
+mirrors a small set to the Hub. No change is required for explicit conditioning.
+
+**Hub mirror policy (current):** the watcher uploads **best‑`UPLOAD_BEST` (by success) + the latest
+complete checkpoint** — `UPLOAD_BEST` defaults to **2**, so by default the Hub holds **best‑2 +
+latest** (previously best‑3). Optionally it also keeps **permanent milestones** every
+`MILESTONE_INTERVAL` steps (e.g. `5000` → 5000, 10000, … kept on the Hub forever; kept locally only
+until uploaded, then the Hub is the archive). On every eviction the watcher **reclaims Hub storage**:
+because `delete_folder()` only drops a checkpoint from HEAD while HF bills LFS/Xet blobs across the
+whole commit history, the watcher calls `permanently_delete_lfs_files(rewrite_history=True)` to
+permanently delete every LFS blob **not** under a kept checkpoint (this also cleans pre‑existing
+orphaned blobs) — so storage actually shrinks after a checkpoint rotates out.
 
 ```bash
 conda activate dreamzero && cd /root/libero_explicit_conditioning
 OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22_future_shift \
 SERVER_GPU=7 TRIALS=10 MAX_TASKS=3 KEEP_BEST=3 KEEP_LATEST=3 \
-UPLOAD_REPO=<your-hf-user>/dreamzero-libero-future-shift-best \
+UPLOAD_BEST=2 MILESTONE_INTERVAL=5000 \
+UPLOAD_REPO=<your-hf-user>/dreamzero-libero-future-shift-best UPLOAD_MODEL_ONLY=1 \
 bash scripts/eval/watch_eval_libero.sh --wandb-run-id dreamzero_libero_wan22_future_shift
 ```
 
 Knobs (env): `SERVER_GPU` (default 7), `TRIALS`, `MAX_TASKS` (default 3; `0` = all 10 tasks),
-`KEEP_BEST`/`KEEP_LATEST`, `UPLOAD_REPO`, `UPLOAD_MODEL_ONLY=1`, `MUJOCO_GL_BACKEND` (default
+`KEEP_BEST`/`KEEP_LATEST` (**local** in‑place retention), `UPLOAD_REPO`, `UPLOAD_BEST` (Hub best‑N,
+default **2**; the Hub mirror is best‑`UPLOAD_BEST` **+ latest**, should be `<= KEEP_BEST`),
+`MILESTONE_INTERVAL` (default `0` = off; e.g. `5000` for permanent 5k‑step Hub milestones),
+`UPLOAD_MODEL_ONLY=1` (≈25 GB model‑only vs full resumable ckpt), `MUJOCO_GL_BACKEND` (default
 `osmesa`). Extra flags pass through (`--wandb-run-id`, `--task-suite-name`, `--all`,
 `--exit-when-done`, …). See `LIBERO.md` §10.4 / §10.7 for the watcher gotchas (sibling eval run,
 OSMesa rendering on busy nodes, watcher‑as‑sole‑pruner).

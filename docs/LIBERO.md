@@ -702,3 +702,103 @@ or just drop it into the watcher's `OUTPUT_DIR`.
 [ ] (bs>1) git checkout libero_distributed; PER_DEVICE_BATCH_SIZE=2               # §10.0/§10.3
 [ ] download best from HF + resume (auto from OUTPUT_DIR)                          # §10.6
 ```
+
+---
+
+# 11. Action-loss-only variant (train ONLY on `train/action_loss`)
+
+This trains the **same** Wan2.2-TI2V-5B LIBERO model but optimizes **only the action flow-matching
+loss**. The video dynamics loss (`train/dynamics_loss`) is still computed and logged for monitoring
+but contributes **no gradient**. The original joint-loss path (§6/§10) is completely unaffected
+(the new behavior is gated behind a config flag that defaults to off).
+
+**What was added** — all in the separate repo copy **`/root/libero_al_only`**, which shares `data/`
+and `checkpoints/` with `/root/dreamzero` via symlinks (so it reuses the same dataset + base weights
+and writes to the same physical `checkpoints/`, but under a different sub-dir):
+
+| Area | File / change |
+|---|---|
+| Loss gate | `groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py` — new `WANPolicyHeadConfig` field `action_loss_only` (default `false`). When true: `loss = weighted_action_loss + 0.0 * weighted_dynamics_loss` (the `0.0*` keeps video-only params in the graph so DDP/DeepSpeed don't error on unused params; dynamics loss is still logged). |
+| Action-head config | `groot/vla/configs/model/dreamzero/action_head/wan_flow_matching_action_tf_wan22_action_loss_only.yaml` (inherits `wan_flow_matching_action_tf_wan22`, sets `action_loss_only: true`). |
+| Training launcher | `scripts/train/libero_training_wan22_action_loss_only.sh` (selects the new head; separate default `OUTPUT_DIR`; auto-exports `PYTHONPATH=$DREAMZERO_ROOT`). |
+
+> **Why the launcher sets `PYTHONPATH`.** `/root/libero_al_only` is a *separate checkout* from the
+> `pip install -e .` editable `groot` (which points at `/root/dreamzero`). `torch.distributed.run`
+> workers do **not** put cwd on `sys.path`, so without `PYTHONPATH=$DREAMZERO_ROOT` they would import
+> the editable `groot` from `/root/dreamzero` and **silently train the joint loss**. The launcher
+> prepends it for you; just make sure you launch from this copy.
+
+## 11.1 Train
+
+```bash
+# (1) conda + secrets. HF_TOKEN + WANDB_API_KEY live in /root/dreamzero/.env (this copy has no .env).
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate dreamzero
+cd /root/libero_al_only
+set -a; . /root/dreamzero/.env; set +a
+
+# (2) launch as ONE line. Distinct WANDB_RUN_ID + its own OUTPUT_DIR so it never collides with the
+#     joint-loss run. On a free-ish node: train on GPUs 0-6, leave GPU 7 for the eval server.
+WANDB_RUN_ID=dreamzero_libero_wan22_action_loss_only NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 SAVE_TOTAL_LIMIT=100000 OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22_action_loss_only LIBERO_DATA_ROOT=$PWD/data/libero_lerobot PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=100000 SAVE_STEPS=1000 SAVE_STRATEGY=steps TRAIN_ARCH=full PYTHON_BIN=$(which python) bash scripts/train/libero_training_wan22_action_loss_only.sh
+```
+
+- **Do not disturb a run already on GPUs 0–6.** If the joint-loss run (§10.3) is occupying GPUs 0–6,
+  do **not** reuse those GPUs (compute contention ~halves throughput of both). Instead run the
+  action-loss-only job on the free GPU alone: `NUM_GPUS=1 CUDA_VISIBLE_DEVICES=7` (single-GPU, so
+  slower, but zero disruption). On a fully free node use `NUM_GPUS=8` and drop `CUDA_VISIBLE_DEVICES`.
+- **Isolation is otherwise automatic:** `--standalone` picks a random rendezvous port (no clash),
+  `OUTPUT_DIR` is a separate sub-dir, and the dataset/base-weights reads are read-only. Just keep
+  `WANDB_RUN_ID` distinct from the joint-loss run (else wandb logs collide).
+- **bs=1** on this branch (`libero_al_only`); grow the global batch via
+  `training_args.gradient_accumulation_steps=N` and/or more GPUs.
+- **Sanity-check it's really action-loss-only:** the launcher prints `Using PYTHONPATH:
+  /root/libero_al_only` and experiment prints `Run name: dreamzero_libero_wan22_action_loss_only`;
+  in wandb `train/loss` should equal `train/action_loss` (dynamics is logged but not optimized).
+- **Resume** is automatic from `OUTPUT_DIR` (same semantics as §6.2/§10.6).
+
+## 11.2 Eval
+
+`action_loss_only` is a **training-only** flag (the model architecture is identical), so eval uses
+the **standard** LIBERO eval path (§7/§10.5) pointed at the action-loss-only checkpoint. The
+checkpoint lives at `/root/dreamzero/checkpoints/dreamzero_libero_wan22_action_loss_only`
+(= `/root/libero_al_only/checkpoints/...` via symlink), so it is visible from either repo. Use a
+**different `--port` / `--video-out-path`** than any concurrent joint-loss eval.
+
+Terminal A — policy server (GPU, `dreamzero`):
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero
+cd /root/dreamzero && set -a; . ./.env; set +a
+CUDA_VISIBLE_DEVICES=7 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/dreamzero_libero_wan22_action_loss_only \
+    --embodiment_tag libero_sim --tokenizer_path ./checkpoints/umt5-xxl --port 8001
+```
+
+Terminal B — sim client (CPU, `dreamzero_libero`):
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero_libero
+cd /root/dreamzero
+MUJOCO_GL=egl python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8001 --task-suite-name libero_spatial \
+    --num-trials-per-task 50 \
+    --video-out-path ./eval_outputs/libero_spatial_action_loss_only/videos
+```
+
+- `--model_path` can be the top-level finished model **or** any `checkpoint-N/` dir.
+- **Automatic eval+upload watcher (§10.4)** also works: point `OUTPUT_DIR` at the action-loss-only
+  dir, pick a spare `SERVER_GPU`, use a **separate** `UPLOAD_REPO`, and pass
+  `--wandb-run-id dreamzero_libero_wan22_action_loss_only`:
+
+```bash
+OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_action_loss_only SERVER_GPU=7 TRIALS=3 KEEP_BEST=3 KEEP_LATEST=3 UPLOAD_REPO=<your-hf-user>/dreamzero-libero-action-loss-only-best bash /root/libero_al_only/scripts/eval/watch_eval_libero.sh --wandb-run-id dreamzero_libero_wan22_action_loss_only
+```
+
+## 11.3 Reproduction checklist (action-loss-only)
+
+```text
+[ ] conda activate dreamzero; cd /root/libero_al_only; set -a; . /root/dreamzero/.env; set +a   # §11.1
+[ ] train via scripts/train/libero_training_wan22_action_loss_only.sh (single line)              # §11.1
+[ ]   distinct WANDB_RUN_ID + OUTPUT_DIR=...wan22_action_loss_only                                # §11.1
+[ ]   GPUs: free node NUM_GPUS=8 | coexist w/ run on 0-6 -> NUM_GPUS=1 CUDA_VISIBLE_DEVICES=7     # §11.1
+[ ]   sanity: "Using PYTHONPATH: /root/libero_al_only"; wandb train/loss == train/action_loss     # §11.1
+[ ] eval (standard path): serve --model_path ...wan22_action_loss_only --port 8001 + sim client   # §11.2
+```

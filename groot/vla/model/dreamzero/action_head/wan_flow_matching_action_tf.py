@@ -121,6 +121,16 @@ class WANPolicyHeadConfig(PretrainedConfig):
     video_inference_final_noise: float = field(
         default=0.8, metadata={"help": "Final noise level for video during decoupled inference (0.0-1.0). E.g., 0.8 means video ends at 80% noise."}
     )
+    # ========== ACTION-LOSS-ONLY TRAINING ==========
+    # When True, the optimized training loss is ONLY the action flow-matching loss. The video
+    # dynamics loss is still computed and logged (train/dynamics_loss) for monitoring, but is
+    # excluded from the gradient (multiplied by 0 so video-only params still receive a zero
+    # gradient, avoiding DDP/DeepSpeed unused-parameter errors). Default False preserves the
+    # original joint (dynamics + action) objective, so existing configs are unaffected.
+    action_loss_only: bool = field(
+        default=False,
+        metadata={"help": "Optimize only the action loss; dynamics loss is logged but not trained."},
+    )
     num_timestep_buckets: int = field(
         default=1000, metadata={"help": "Number of timestep discretization buckets."}
     )
@@ -797,7 +807,14 @@ class WANPolicyHead(ActionHead):
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
                 weighted_action_loss = weight_action.mean()
-                loss = weighted_dynamics_loss + weighted_action_loss
+                if getattr(self.config, "action_loss_only", False):
+                    # Action-loss-only training: optimize the action loss alone. Keep the dynamics
+                    # loss in the graph with a 0 coefficient so video-only params still receive a
+                    # (zero) gradient -> avoids DDP/DeepSpeed "parameter did not receive grad"
+                    # errors. The unweighted dynamics_loss is still logged below for monitoring.
+                    loss = weighted_action_loss + 0.0 * weighted_dynamics_loss
+                else:
+                    loss = weighted_dynamics_loss + weighted_action_loss
             else:
                 weighted_action_loss = torch.tensor(0.0, device=self._device)
                 loss = weighted_dynamics_loss

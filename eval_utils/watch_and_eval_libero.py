@@ -141,8 +141,11 @@ def save_state(state_path, evaluated, failed, results, uploaded):
 
 
 # ------------------------------ retention ------------------------------
-def compute_retention(output_dir, keep_latest, keep_best, results):
-    """Return (keep_steps:set, best_steps:list) for latest-L UNION best-M over existing ckpts."""
+def compute_retention(output_dir, keep_latest, keep_best, results, milestone_interval=0, uploaded=None):
+    """Return (keep_steps:set, best_steps:list) for latest-L UNION best-M over existing ckpts.
+    Milestone checkpoints (every `milestone_interval` steps) are kept locally until they have been
+    uploaded to the Hub (the Hub is the permanent milestone archive; once uploaded the local copy
+    may be evicted to keep disk lean)."""
     all_ck = find_all_checkpoints(output_dir)
     if not all_ck:
         return set(), []
@@ -155,13 +158,18 @@ def compute_retention(output_dir, keep_latest, keep_best, results):
     )
     best_steps = [s for s, _ in ranked[:keep_best]]
     keep = latest_keep | set(best_steps) | {newest}
+    if milestone_interval and milestone_interval > 0:
+        up = uploaded or set()
+        keep |= {s for s in existing if s % milestone_interval == 0 and s not in up}
     return keep, best_steps
 
 
-def apply_retention(output_dir, keep_latest, keep_best, results, manifest_path):
-    """Delete complete checkpoints not in latest-L UNION best-M (in place). Never deletes the
-    newest or an in-progress (incomplete) checkpoint. Returns best_steps."""
-    keep, best_steps = compute_retention(output_dir, keep_latest, keep_best, results)
+def apply_retention(output_dir, keep_latest, keep_best, results, manifest_path,
+                    milestone_interval=0, uploaded=None):
+    """Delete complete checkpoints not in latest-L UNION best-M UNION not-yet-uploaded milestones
+    (in place). Never deletes the newest or an in-progress (incomplete) checkpoint. Returns best_steps."""
+    keep, best_steps = compute_retention(output_dir, keep_latest, keep_best, results,
+                                         milestone_interval, uploaded)
     if not keep:
         return best_steps
     complete = {s for s, _ in find_complete_checkpoints(output_dir)}
@@ -269,9 +277,20 @@ class HfUploader(threading.Thread):
                         )
                     except Exception as e:  # noqa: BLE001
                         log(f"upload: delete checkpoint-{step} (likely already gone): {e}")
+                    # delete_folder only removes the pointer; the LFS/Xet blob lingers in storage and
+                    # is still billed. Permanently delete the now-unreferenced blobs to actually reclaim.
+                    try:
+                        victims = [f for f in self.api.list_lfs_files(self.repo_id, repo_type=self.repo_type)
+                                   if (f.filename or "").startswith(f"checkpoint-{step}/")]
+                        if victims:
+                            self.api.permanently_delete_lfs_files(
+                                self.repo_id, victims, repo_type=self.repo_type)
+                            log(f"upload: permanently deleted {len(victims)} LFS blobs of checkpoint-{step}")
+                    except Exception as e:  # noqa: BLE001
+                        log(f"upload: permanent LFS delete of checkpoint-{step} failed: {e}")
                     self.mark_deleted(step)
                     log(f"upload: removed checkpoint-{step} from {self.repo_id}")
-                    self._maybe_squash()  # reclaim the evicted blob's storage from history
+                    self._maybe_squash()  # tidy git history (blobs already permanently deleted above)
             except Exception as e:  # noqa: BLE001
                 log(f"upload: FAILED {action} checkpoint-{step}: {e}")
             finally:
@@ -390,6 +409,9 @@ def main():
                          "watcher-managed retention; the watcher becomes the sole pruner)")
     ap.add_argument("--keep-latest-n", type=int, default=5,
                     help="also always keep the latest-N checkpoints by step (default 5)")
+    ap.add_argument("--milestone-interval", type=int, default=0,
+                    help="permanently keep every Nth-step checkpoint as a milestone on the Hub "
+                         "(e.g. 5000 -> keep 5000,10000,15000,...; 0 disables)")
     # wandb
     ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--wandb-run-id", default=None)
@@ -467,6 +489,12 @@ def main():
         complete = [s for s, _ in find_complete_checkpoints(output_dir)]
         if complete:
             upload_set.add(max(complete))
+        # HF is the permanent milestone archive: always keep every milestone checkpoint that is
+        # already uploaded or currently available locally; milestones are never evicted from the Hub.
+        mi = args.milestone_interval
+        if mi and mi > 0:
+            upload_set |= {s for s in uploaded if s % mi == 0}
+            upload_set |= {s for s in complete if s % mi == 0}
         for s in sorted(upload_set):
             if s in uploaded:
                 continue
@@ -481,7 +509,8 @@ def main():
             # 1) prune in place to latest-L UNION best-M (every cycle; cheap)
             if args.keep_best_n > 0:
                 best_steps = apply_retention(
-                    output_dir, args.keep_latest_n, args.keep_best_n, results, manifest_path)
+                    output_dir, args.keep_latest_n, args.keep_best_n, results, manifest_path,
+                    args.milestone_interval, uploaded)
                 sync_uploads(best_steps)
 
             # 2) evaluate new checkpoint(s)
@@ -533,7 +562,8 @@ def main():
                     # re-run retention now that we have a new result (may promote/evict best)
                     if args.keep_best_n > 0:
                         best_steps = apply_retention(
-                            output_dir, args.keep_latest_n, args.keep_best_n, results, manifest_path)
+                            output_dir, args.keep_latest_n, args.keep_best_n, results, manifest_path,
+                    args.milestone_interval, uploaded)
                         sync_uploads(best_steps)
             else:
                 finished = os.path.isfile(os.path.join(output_dir, "config.json"))

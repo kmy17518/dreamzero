@@ -79,6 +79,10 @@ SAVE_STEPS=${SAVE_STEPS:-500}
 # checkpoints aren't rotated away before/after they're evaluated.
 SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-5}
 SAVE_LORA_ONLY=${SAVE_LORA_ONLY:-false}  # only relevant if TRAIN_ARCH=lora
+# DeepSpeed config. Default ZeRO-2 (matches the other launchers). For full finetune on FEW GPUs
+# (e.g. a 2-GPU smoke test) the per-GPU optimizer state can OOM at the Adam step; point this at
+# groot/vla/configs/deepspeed/zero2_offload.json (CPU optimizer offload) or zero3.json to fit.
+DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-groot/vla/configs/deepspeed/zero2.json}
 
 # Wan2.2-TI2V-5B checkpoint (diffusion weights, T5 encoder, VAE)
 WAN22_CKPT_DIR=${WAN22_CKPT_DIR:-"$DREAMZERO_ROOT/checkpoints/Wan2.2-TI2V-5B"}
@@ -120,7 +124,7 @@ cd "$DREAMZERO_ROOT"
     num_state_per_block=1 \
     seed=42 \
     training_args.learning_rate=${LR:-1e-5} \
-    training_args.deepspeed="groot/vla/configs/deepspeed/zero2.json" \
+    training_args.deepspeed="$DEEPSPEED_CONFIG" \
     save_steps=$SAVE_STEPS \
     training_args.warmup_ratio=0.05 \
     output_dir=$OUTPUT_DIR \

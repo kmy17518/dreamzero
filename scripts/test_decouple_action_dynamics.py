@@ -286,10 +286,125 @@ def test_dynamics_action_decoupled_inference() -> None:
     print("  -> inference dynamics->action decoupling OK\n")
 
 
+def test_train_eval_consistency_bidir() -> None:
+    """With BOTH gates ON (the wan_flow_matching_action_tf_wan22_decoupled_bidir config), the
+    teacher-forcing (train) path and the autoregressive KV-cache (eval) path must implement the SAME
+    attention connectivity: each output group must depend on the same input groups in train and in
+    eval. (The tests above toggle one flag at a time; this one turns both on.)
+
+    Dependency matrix rows=output {video, action}, cols=input {obs, cur_noisy, action, state}, where
+    obs = clean observation video in train / the KV cache in eval. Intended (identical) pattern:
+        video  -> obs=Y, cur_noisy=Y(self), action=N(cut), state=Y
+        action -> obs=Y, cur_noisy=N(cut),  action=Y(self), state=Y
+    """
+    cols = ["obs", "cur_noisy", "action", "state"]
+    expected = {
+        "video":  {"obs": "Y", "cur_noisy": "Y", "action": "N", "state": "Y"},
+        "action": {"obs": "Y", "cur_noisy": "N", "action": "Y", "state": "Y"},
+    }
+
+    def dep(d: float) -> str:
+        if d > 1e-2:
+            return "Y"
+        if d < 1e-6:
+            return "N"
+        return f"?({d:.1e})"
+
+    attn = build_attn()
+    attn.decouple_action_dynamics = True
+    attn.decouple_dynamics_action = True
+    freqs_action = rope_params(1024 * 10, HEAD_DIM)
+    freqs_state = rope_params(1024, HEAD_DIM)
+
+    # ---- TRAIN (teacher forcing): [clean video | noisy video | action | state] ----
+    num_image_blocks = (NOISY_FRAMES - 1) // NUM_FRAME_PER_BLOCK
+    slv = NOISY_FRAMES * FRAME_SEQLEN
+    action_h = num_image_blocks * NUM_ACTION_PER_BLOCK
+    state_h = num_image_blocks * NUM_STATE_PER_BLOCK
+    R = action_h + state_h
+    s = 2 * slv + R
+    freqs = video_freqs(slv)
+    base_x = torch.randn(B, s, DIM)
+    train_in = {
+        "obs": slice(0, slv),
+        "cur_noisy": slice(slv, 2 * slv),
+        "action": slice(2 * slv, 2 * slv + action_h),
+        "state": slice(2 * slv + action_h, s),
+    }
+    train_out = {"video": slice(slv, 2 * slv), "action": slice(2 * slv, 2 * slv + action_h)}
+
+    def run_train(x):
+        with torch.no_grad():
+            out, _ = attn(x=x, freqs=freqs, freqs_action=freqs_action, freqs_state=freqs_state,
+                          action_register_length=R, kv_cache=None, is_tf=True)
+        return out
+
+    base_t = run_train(base_x)
+    train_mat = {r: {} for r in train_out}
+    for c, sl in train_in.items():
+        xp = base_x.clone()
+        xp[:, sl] += 5.0
+        op = run_train(xp)
+        for r, rsl in train_out.items():
+            train_mat[r][c] = dep(max_abs_diff(op[:, rsl], base_t[:, rsl]))
+
+    # ---- EVAL (autoregressive KV-cache): x=[noisy video | action | state], cache=clean obs ----
+    R2 = NUM_ACTION_PER_BLOCK + NUM_STATE_PER_BLOCK
+    num_new = NUM_FRAME_PER_BLOCK * FRAME_SEQLEN
+    cache_len = 2 * FRAME_SEQLEN
+    s2 = num_new + R2
+    freqs2 = video_freqs(num_new)
+    base_x2 = torch.randn(B, s2, DIM)
+    base_cache = torch.randn(2, B, cache_len, NUM_HEADS, HEAD_DIM)
+    eval_out = {"video": slice(0, num_new), "action": slice(num_new, num_new + NUM_ACTION_PER_BLOCK)}
+    eval_in = {  # "obs" is the kv-cache, handled separately below
+        "cur_noisy": slice(0, num_new),
+        "action": slice(num_new, num_new + NUM_ACTION_PER_BLOCK),
+        "state": slice(num_new + NUM_ACTION_PER_BLOCK, s2),
+    }
+
+    def run_eval(x, cache):
+        with torch.no_grad():
+            out, _ = attn(x=x, freqs=freqs2, freqs_action=freqs_action, freqs_state=freqs_state,
+                          action_register_length=R2, kv_cache=cache.clone(),
+                          current_start_frame=1, is_tf=False)
+        return out
+
+    base_e = run_eval(base_x2, base_cache)
+    eval_mat = {r: {} for r in eval_out}
+    cache_p = base_cache.clone()
+    cache_p += 5.0  # "obs" = perturb the cached clean observations
+    op = run_eval(base_x2, cache_p)
+    for r, rsl in eval_out.items():
+        eval_mat[r]["obs"] = dep(max_abs_diff(op[:, rsl], base_e[:, rsl]))
+    for c, sl in eval_in.items():
+        xp = base_x2.clone()
+        xp[:, sl] += 5.0
+        op = run_eval(xp, base_cache)
+        for r, rsl in eval_out.items():
+            eval_mat[r][c] = dep(max_abs_diff(op[:, rsl], base_e[:, rsl]))
+
+    for name, mat in (("train", train_mat), ("eval ", eval_mat)):
+        for r in ("video", "action"):
+            print(f"  [{name}/{r:>6}] " + "  ".join(f"{c}={mat[r][c]}" for c in cols))
+
+    for r in ("video", "action"):
+        for c in cols:
+            assert train_mat[r][c] == expected[r][c], \
+                f"train {r}/{c}={train_mat[r][c]} expected {expected[r][c]}"
+            assert eval_mat[r][c] == expected[r][c], \
+                f"eval {r}/{c}={eval_mat[r][c]} expected {expected[r][c]}"
+            assert train_mat[r][c] == eval_mat[r][c], \
+                f"train/eval disagree at {r}/{c}: train={train_mat[r][c]} eval={eval_mat[r][c]}"
+
+    print("  -> train/eval consistency (bidirectional, both gates on) OK\n")
+
+
 if __name__ == "__main__":
     print(f"torch={torch.__version__} ATTENTION_BACKEND={os.environ.get('ATTENTION_BACKEND')}\n")
     test_training_teacher_forcing()
     test_inference_kv_cache()
     test_dynamics_action_decoupled_training()
     test_dynamics_action_decoupled_inference()
+    test_train_eval_consistency_bidir()
     print("ALL CHECKS PASSED")

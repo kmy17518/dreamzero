@@ -802,3 +802,134 @@ OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_action_loss_only S
 [ ]   sanity: "Using PYTHONPATH: /root/libero_al_only"; wandb train/loss == train/action_loss     # §11.1
 [ ] eval (standard path): serve --model_path ...wan22_action_loss_only --port 8001 + sim client   # §11.2
 ```
+
+---
+
+# 12. Action/dynamics-decoupled variant (action tokens do NOT attend to the generated video)
+
+This trains the **same** Wan2.2-TI2V-5B LIBERO model and still optimizes **both** losses jointly
+(`train/dynamics_loss` **and** `train/action_loss`, exactly like §6/§10), but it changes the **DiT
+self-attention** so that **action tokens are prevented from attending to the noisy / being-generated
+("future") video tokens** during denoising. Action tokens still attend to the **clean observation
+context** (the current + past frames), their own action block, and their state block. Video tokens
+are **unchanged** — they still attend to action tokens. The net effect is that the action pathway
+can no longer "peek" at the generated video side, i.e. the **action loss and dynamics loss are
+decoupled at the attention level** (the action head only conditions on real observations, not on
+the video the model is dreaming up).
+
+> **How this differs from the other two variants.** §6/§10 is the **joint/coupled** baseline
+> (action attends to the generated video). §11 (**action-loss-only**) is a *loss* gate (it stops the
+> dynamics gradient; attention is left coupled). This §12 variant is an *attention* gate (it keeps
+> **both** losses but severs action→generated-video attention). The two gates are orthogonal and
+> default to off, so the §6/§10 and §11 paths are completely unaffected.
+
+**What was added** — all in the separate repo copy **`/root/libero_al_dl_decoupled`** (branch
+`libero_al_dl_decoupled`), which shares `data/` and `checkpoints/` with `/root/dreamzero` via
+symlinks (same dataset + base weights, writes to the same physical `checkpoints/` under a different
+sub-dir):
+
+| Area | File / change |
+|---|---|
+| Attention gate | `groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py` — new flag `decouple_action_dynamics` (default `false`) threaded `CausalWanModel` → `CausalWanAttentionBlock` → `CausalWanSelfAttention`. When `true`, the action block's K/V context **drops the noisy video tokens** in (a) the training teacher-forcing path (`_process_noisy_action_blocks`: action attends to `clean_obs[:i] + action[i] + state[i]` only), (b) the inference KV-cache path (action attends to the **cached** clean observations + action register, not the current noisy block), and (c) the `_blockwise_causal_flash_attn` action loop (for completeness). Default `false` = original joint attention. |
+| Action-head config | `groot/vla/configs/model/dreamzero/action_head/wan_flow_matching_action_tf_wan22_decoupled.yaml` (inherits `wan_flow_matching_action_tf_wan22`, sets `diffusion_model_cfg.decouple_action_dynamics: true`). |
+| Training launcher | `scripts/train/libero_training_wan22_decoupled.sh` (selects the new head; separate default `OUTPUT_DIR`; auto-exports `PYTHONPATH=$DREAMZERO_ROOT`). |
+| Unit test | `scripts/test_decouple_action_dynamics.py` (CPU; proves action output is bitwise-independent of the noisy video yet still depends on the clean observation, for both the train and inference paths). |
+
+> **Why the launcher sets `PYTHONPATH`** (same reason as §11). `/root/libero_al_dl_decoupled` is a
+> *separate checkout* from the `pip install -e .` editable `groot` (which points at `/root/dreamzero`).
+> `torch.distributed.run` workers do **not** put cwd on `sys.path`, so without
+> `PYTHONPATH=$DREAMZERO_ROOT` they would import the editable `groot` from `/root/dreamzero` and
+> **silently train the coupled attention**. The launcher prepends it for you; just launch from this copy.
+
+> **Eval needs no special flag.** `decouple_action_dynamics` lives on the diffusion-model config, so
+> it is persisted in the checkpoint's `config.json` and is rebuilt automatically when the policy
+> server loads the model — eval uses the **standard** path (§7/§10.5/§12.2), just pointed at the
+> decoupled checkpoint.
+
+## 12.1 Train
+
+```bash
+# (1) conda + secrets. HF_TOKEN + WANDB_API_KEY live in /root/dreamzero/.env (this copy has no .env).
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate dreamzero
+cd /root/libero_al_dl_decoupled
+set -a; . /root/dreamzero/.env; set +a
+
+# (2) launch as ONE line. Distinct WANDB_RUN_ID + its own OUTPUT_DIR so it never collides with the
+#     joint-loss (§10) or action-loss-only (§11) runs. On a free-ish node: train on GPUs 0-6,
+#     leave GPU 7 for the eval server.
+WANDB_RUN_ID=dreamzero_libero_wan22_decoupled NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 SAVE_TOTAL_LIMIT=100000 OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22_decoupled LIBERO_DATA_ROOT=$PWD/data/libero_lerobot PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=100000 SAVE_STEPS=1000 SAVE_STRATEGY=steps TRAIN_ARCH=full PYTHON_BIN=$(which python) bash scripts/train/libero_training_wan22_decoupled.sh
+```
+
+- **Do not disturb a run already on GPUs 0–6.** If the joint-loss (§10.3) or action-loss-only
+  (§11.1) run is occupying GPUs 0–6, run this job on the free GPU alone:
+  `NUM_GPUS=1 CUDA_VISIBLE_DEVICES=7` (single-GPU, slower, zero disruption). On a fully free node use
+  `NUM_GPUS=8` and drop `CUDA_VISIBLE_DEVICES`.
+- **Isolation is otherwise automatic:** `--standalone` picks a random rendezvous port, `OUTPUT_DIR`
+  is a separate sub-dir, and the dataset/base-weights reads are read-only. Just keep `WANDB_RUN_ID`
+  distinct from the other runs.
+- **bs=1** on this branch; grow the global batch via `training_args.gradient_accumulation_steps=N`
+  and/or more GPUs.
+- **Sanity-check it's the decoupled variant:** the launcher prints `Using PYTHONPATH:
+  /root/libero_al_dl_decoupled`, the experiment prints `Run name:
+  dreamzero_libero_wan22_decoupled`, and the saved `checkpoint-*/config.json` contains
+  `"decouple_action_dynamics": true` inside `diffusion_model_cfg`. Unlike §11, **both** `train/loss`
+  components are optimized (`train/loss ≈ train/dynamics_loss + train/action_loss`).
+- **Resume** is automatic from `OUTPUT_DIR` (same semantics as §6.2/§10.6).
+- **Optional offline check of the attention behavior** (no GPU / no base weights needed):
+  ```bash
+  PYTHONPATH=/root/libero_al_dl_decoupled ATTENTION_BACKEND=torch \
+      python scripts/test_decouple_action_dynamics.py
+  ```
+  It asserts that, with the flag on, the action output is **bitwise-independent** of the noisy video
+  (train + inference paths) yet still varies with the clean observation, and that video→action
+  attention is preserved.
+
+## 12.2 Eval
+
+`decouple_action_dynamics` is baked into the checkpoint's `config.json` (see above), so eval uses the
+**standard** LIBERO eval path (§7/§10.5) pointed at the decoupled checkpoint. The checkpoint lives at
+`/root/dreamzero/checkpoints/dreamzero_libero_wan22_decoupled`
+(= `/root/libero_al_dl_decoupled/checkpoints/...` via symlink), so it is visible from either repo.
+Use a **different `--port` / `--video-out-path`** than any concurrent joint-loss / action-loss-only
+eval.
+
+Terminal A — policy server (GPU, `dreamzero`):
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero
+cd /root/dreamzero && set -a; . ./.env; set +a
+CUDA_VISIBLE_DEVICES=7 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/dreamzero_libero_wan22_decoupled \
+    --embodiment_tag libero_sim --tokenizer_path ./checkpoints/umt5-xxl --port 8002
+```
+
+Terminal B — sim client (CPU, `dreamzero_libero`):
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero_libero
+cd /root/dreamzero
+MUJOCO_GL=egl python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8002 --task-suite-name libero_spatial \
+    --num-trials-per-task 50 \
+    --video-out-path ./eval_outputs/libero_spatial_decoupled/videos
+```
+
+- `--model_path` can be the top-level finished model **or** any `checkpoint-N/` dir.
+- **Automatic eval+upload watcher (§10.4)** also works: point `OUTPUT_DIR` at the decoupled dir, pick
+  a spare `SERVER_GPU`, use a **separate** `UPLOAD_REPO`, and pass
+  `--wandb-run-id dreamzero_libero_wan22_decoupled`:
+
+```bash
+OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_decoupled SERVER_GPU=7 TRIALS=3 KEEP_BEST=3 KEEP_LATEST=3 UPLOAD_REPO=<your-hf-user>/dreamzero-libero-decoupled-best bash /root/libero_al_dl_decoupled/scripts/eval/watch_eval_libero.sh --wandb-run-id dreamzero_libero_wan22_decoupled
+```
+
+## 12.3 Reproduction checklist (action/dynamics-decoupled)
+
+```text
+[ ] conda activate dreamzero; cd /root/libero_al_dl_decoupled; set -a; . /root/dreamzero/.env; set +a  # §12.1
+[ ] (optional) PYTHONPATH=$PWD ATTENTION_BACKEND=torch python scripts/test_decouple_action_dynamics.py # §12.1
+[ ] train via scripts/train/libero_training_wan22_decoupled.sh (single line)                            # §12.1
+[ ]   distinct WANDB_RUN_ID + OUTPUT_DIR=...wan22_decoupled                                             # §12.1
+[ ]   GPUs: free node NUM_GPUS=8 | coexist w/ run on 0-6 -> NUM_GPUS=1 CUDA_VISIBLE_DEVICES=7           # §12.1
+[ ]   sanity: "Using PYTHONPATH: /root/libero_al_dl_decoupled"; config.json has decouple_action_dynamics=true  # §12.1
+[ ] eval (standard path): serve --model_path ...wan22_decoupled --port 8002 + sim client               # §12.2
+```

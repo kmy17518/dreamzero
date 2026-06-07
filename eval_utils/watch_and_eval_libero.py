@@ -402,8 +402,7 @@ def main():
         os.environ["WANDB_MODE"] = args.wandb_mode
         import wandb
         wandb_run = wandb.init(
-            project=project, id=run_id,
-            resume=("allow" if not args.separate_run else None),
+            project=project, id=run_id, resume="allow",
             name=(run_id if args.separate_run else None),
             job_type="libero_eval",
         )

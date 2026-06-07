@@ -483,7 +483,8 @@ sends an `endpoint` field and supports `reset`), **not** openpi's `websocket_cli
 - **Eval + upload watcher (branch `libero`).** `eval_utils/watch_and_eval_libero.py` +
   `scripts/eval/watch_eval_libero.sh`: watches a training `OUTPUT_DIR`, runs the §7 LIBERO sim eval
   on each new `checkpoint-N` (policy server on a spare GPU + LIBERO client), logs
-  `eval/success_rate` (+ per-task) to the **same wandb run** (custom `eval/ckpt_step` axis), keeps
+  `eval/success_rate` (+ per-task) to a **sibling wandb run `<run>-eval`** (custom `eval/ckpt_step`
+  axis; a sibling run because a watcher + training cannot reliably share one *live* run), keeps
   **`latest-N ∪ best-M`** checkpoints in place (originals → full/resumable, deduped), and mirrors
   the best-M to a **HuggingFace Hub** repo (upload on enter best-M, delete on evict, background).
 - **Configurable `SAVE_TOTAL_LIMIT`** in `scripts/train/libero_training_wan22.sh` (env
@@ -588,26 +589,31 @@ NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 SAVE_TOTAL_LIMIT=100000 OUTPUT_DIR
 ## 10.4 Eval + best-checkpoint mirror — automatic watcher (recommended)
 
 Run in a second terminal alongside training. It serves each new checkpoint on `SERVER_GPU`, runs the
-sim eval, logs to the same wandb run, keeps `latest-N ∪ best-M` locally (full/resumable), and mirrors
-best-M to the Hub. The launcher self-sources conda + `.env`.
+sim eval, logs to a **sibling `<run>-eval` wandb run**, keeps `latest-N ∪ best-M` locally
+(full/resumable), and mirrors best-M to the Hub. The launcher self-sources conda + `.env`.
 
 ```bash
-OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22 SERVER_GPU=7 TRIALS=3 KEEP_BEST=3 KEEP_LATEST=3 UPLOAD_REPO=<your-hf-user>/dreamzero-libero-best bash /root/dreamzero/scripts/eval/watch_eval_libero.sh --wandb-run-id dreamzero_libero_wan22
+OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22 SERVER_GPU=7 TRIALS=3 KEEP_BEST=3 KEEP_LATEST=3 UPLOAD_REPO=<your-hf-user>/dreamzero-libero-best bash /root/dreamzero/scripts/eval/watch_eval_libero.sh --wandb-run-id <training-run-id>
 ```
 
-Knobs (env): `SERVER_GPU` (default 7), `TRIALS` (per task, default 10), `MAX_TASKS` (0=all),
-`KEEP_BEST` (>0 enables in-place retention + best-N), `KEEP_LATEST` (default 5), `UPLOAD_REPO`
-(enables HF mirror), `UPLOAD_MODEL_ONLY=1` (upload ~25 GB model-only instead of full ~130 GB).
-Extra flags pass through (e.g. `--wandb-run-id`, `--task-suite-name`, `--all`, `--exit-when-done`,
-`--upload-public`, `--separate-run`).
+Pass `--wandb-run-id` = the training run id; eval is logged to `<training-run-id>-eval` (same
+wandb project, so you can overlay `eval/success_rate` with the training curves in one chart).
+
+Knobs (env): `SERVER_GPU` (default 7), `TRIALS` (per task, default 10), `MAX_TASKS` (default **3** =
+first 3 tasks of the suite; set `0` for all 10), `KEEP_BEST` (>0 enables in-place retention + best-N),
+`KEEP_LATEST` (default 5), `UPLOAD_REPO` (enables HF mirror), `UPLOAD_MODEL_ONLY=1` (~25 GB model-only
+instead of full ~130 GB), `SEPARATE_RUN` (default **1** = sibling eval run; `0` = attempt same-run,
+not recommended), `MUJOCO_GL_BACKEND` (default `osmesa`; see gotcha #6). Extra flags pass through
+(e.g. `--wandb-run-id`, `--task-suite-name`, `--all`, `--exit-when-done`, `--upload-public`).
 
 - **Full checkpoints incl. optimizer are kept/uploaded by default** (resumable). A full ckpt ≈ 130 GB.
 - **HF storage:** free private = 100 GB (a single full ckpt won't fit), PRO = 1 TB. For free use
   `UPLOAD_MODEL_ONLY=1` (best-3 ≈ 75 GB).
-- **Timing (H200, `libero_spatial`, untrained = worst case):** server load ~2 min, ~1.5 s/query,
-  ~44 queries per full 220-step episode ⇒ ~35–40 min for 3 trials × 10 tasks; faster as the policy
-  starts succeeding (episodes end early). Eval (~38 min) > checkpoint cadence (~21 min/1k steps at
-  bs=1), so with the default `--latest-only` the watcher evaluates roughly every other checkpoint.
+- **Timing (H200, `libero_spatial`, untrained = worst case, OSMesa CPU render):** server load ~2 min,
+  ~2–2.5 min per full 220-step episode ⇒ **~20–25 min for the default 3 trials × 3 tasks**
+  (`MAX_TASKS=3`), or ~60–75 min for 3 trials × 10 tasks (`MAX_TASKS=0`). Faster as the policy
+  succeeds (episodes end early). `--latest-only` evaluates the newest checkpoint each cycle and skips
+  behind to keep up with the ~21 min/1k-step (bs=1) checkpoint cadence.
 
 ## 10.5 Eval — manual, single model (two terminals; §7 with /root paths)
 
@@ -673,8 +679,14 @@ or just drop it into the watcher's `OUTPUT_DIR`.
    `apt-get install -y libosmesa6` and run the client with `MUJOCO_GL=osmesa`. The watcher
    (`scripts/eval/watch_eval_libero.sh`) **defaults to `MUJOCO_GL_BACKEND=osmesa`** for this reason;
    only set `MUJOCO_GL_BACKEND=egl` if you have a fully-idle GPU dedicated to rendering. (The watcher
-   also pins EGL to `SERVER_GPU` when EGL is used.) OSMesa adds a little CPU per render but eval is
-   inference-bound, so wall-clock is ~unchanged.
+   also pins EGL to `SERVER_GPU` when EGL is used.) OSMesa renders on CPU (~2× slower per episode than
+   GPU EGL) but is robust and runs on the spare GPU's host, so it doesn't slow training.
+7. **wandb eval logging uses a sibling run.** A watcher and training can't both live-write to one
+   wandb run — the second writer's points are silently dropped (`train/*` lands, `eval/*` vanishes).
+   The watcher logs eval to **`<run>-eval`** by default (`SEPARATE_RUN=1`); overlay it with the
+   training run in the wandb UI (same project). Separately, wandb's default x-axis `Step` (`_step`)
+   counts `wandb.log()` calls (~2× the real step here, since the trainer logs ~2 things/step) — set
+   the chart **X-Axis to `train/global_step`** to match the terminal step.
 
 ## 10.8 Reproduction checklist (this iteration)
 

@@ -22,13 +22,17 @@ OUTPUT_DIR=${OUTPUT_DIR:-"$PWD/checkpoints/dreamzero_libero_wan22"}
 EXTRA=()
 [ -n "$UPLOAD_REPO" ] && EXTRA+=(--upload-repo "$UPLOAD_REPO")
 [ "${UPLOAD_MODEL_ONLY:-0}" = "1" ] && EXTRA+=(--upload-model-only)
+# Eval logs to a sibling "<run>-eval" wandb run by default: a watcher and training cannot reliably
+# share one *live* run (the second writer's points are silently dropped). Set SEPARATE_RUN=0 to
+# attempt same-run logging (not recommended).
+[ "${SEPARATE_RUN:-1}" = "1" ] && EXTRA+=(--separate-run)
 
 exec python eval_utils/watch_and_eval_libero.py \
     --output-dir "$OUTPUT_DIR" \
     --server-gpu "${SERVER_GPU:-7}" \
     --task-suite-name "${TASK_SUITE:-libero_spatial}" \
     --num-trials-per-task "${TRIALS:-10}" \
-    --max-tasks "${MAX_TASKS:-0}" \
+    --max-tasks "${MAX_TASKS:-3}" \
     --keep-best-n "${KEEP_BEST:-0}" \
     --keep-latest-n "${KEEP_LATEST:-5}" \
     --mujoco-gl "${MUJOCO_GL_BACKEND:-osmesa}" \

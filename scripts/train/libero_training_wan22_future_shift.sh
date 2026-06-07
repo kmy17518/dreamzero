@@ -81,7 +81,7 @@ cd "$DREAMZERO_ROOT"
 "${RUN_CMD[@]}" \
     report_to=${REPORT_TO:-wandb} \
     data=dreamzero/libero_relative_wan22 \
-    wandb_project=${WANDB_PROJECT:-dreamzero_libero_future_shift} \
+    wandb_project=${WANDB_PROJECT:-dreamzero_libero} \
     train_architecture=$TRAIN_ARCH \
     num_frames=33 \
     action_horizon=24 \

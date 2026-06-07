@@ -193,13 +193,18 @@ class HfUploader(threading.Thread):
     on evict). Updates the `uploaded` set + state via the provided callbacks."""
 
     def __init__(self, repo_id, repo_type, model_only, private, token,
-                 mark_uploaded, mark_deleted):
+                 mark_uploaded, mark_deleted, squash_interval=900):
         super().__init__(daemon=True)
         self.repo_id = repo_id
         self.repo_type = repo_type
         self.model_only = model_only
         self.mark_uploaded = mark_uploaded
         self.mark_deleted = mark_deleted
+        # HF bills LFS blobs across the WHOLE commit history, so delete_folder() alone never frees
+        # space (the blob lingers in history). Periodically squash history -> 1 commit of the current
+        # state so evicted checkpoints' blobs become unreferenced and get GC'd. Throttled.
+        self.squash_interval = squash_interval
+        self._last_squash = 0.0
         self.q: "queue.Queue" = queue.Queue()
         self._stop = threading.Event()
         from huggingface_hub import HfApi
@@ -214,6 +219,24 @@ class HfUploader(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+    def _maybe_squash(self, force=False):
+        """Collapse repo history to a single commit so blobs from evicted checkpoints are no longer
+        referenced (and thus reclaimed by the Hub). Without this, deletes keep accumulating in
+        history and HF keeps billing them. Throttled to once per `squash_interval` seconds."""
+        now = time.time()
+        if not force and (now - self._last_squash) < self.squash_interval:
+            return
+        try:
+            self.api.super_squash_history(
+                repo_id=self.repo_id,
+                repo_type=self.repo_type,
+                commit_message="squash history to reclaim evicted-checkpoint LFS storage",
+            )
+            self._last_squash = now
+            log(f"upload: squashed history of {self.repo_id} (reclaim evicted-ckpt storage)")
+        except Exception as e:  # noqa: BLE001
+            log(f"upload: squash history failed (will retry): {e}")
 
     def run(self):
         while not self._stop.is_set():
@@ -248,6 +271,7 @@ class HfUploader(threading.Thread):
                         log(f"upload: delete checkpoint-{step} (likely already gone): {e}")
                     self.mark_deleted(step)
                     log(f"upload: removed checkpoint-{step} from {self.repo_id}")
+                    self._maybe_squash()  # reclaim the evicted blob's storage from history
             except Exception as e:  # noqa: BLE001
                 log(f"upload: FAILED {action} checkpoint-{step}: {e}")
             finally:

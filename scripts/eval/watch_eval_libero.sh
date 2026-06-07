@@ -31,5 +31,6 @@ exec python eval_utils/watch_and_eval_libero.py \
     --max-tasks "${MAX_TASKS:-0}" \
     --keep-best-n "${KEEP_BEST:-0}" \
     --keep-latest-n "${KEEP_LATEST:-5}" \
+    --mujoco-gl "${MUJOCO_GL_BACKEND:-osmesa}" \
     "${EXTRA[@]}" \
     "$@"

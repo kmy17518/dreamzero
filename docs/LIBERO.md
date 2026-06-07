@@ -494,7 +494,8 @@ sends an `endpoint` field and supports `reset`), **not** openpi's `websocket_cli
 ## 10.1 Fresh-instance environment setup
 
 **Prereqs:** CUDA 12.x toolkit at `/usr/local/cuda` (provides `nvcc`); H100/H200 GPUs;
-`/root/dreamzero/.env` containing `HF_TOKEN=...` and `WANDB_API_KEY=...`.
+`/root/dreamzero/.env` containing `HF_TOKEN=...` and `WANDB_API_KEY=...`; and for eval rendering on
+a busy multi-GPU node, the OSMesa CPU-rendering lib: `apt-get install -y libosmesa6 libgl1-mesa-glx`.
 
 **Install Miniconda (if no conda):**
 ```bash
@@ -665,6 +666,15 @@ or just drop it into the watcher's `OUTPUT_DIR`.
 4. **Watcher = sole pruner** (with `SAVE_TOTAL_LIMIT` high). It must stay running, else checkpoints
    accumulate (~130 GB each). Normal footprint `latest-N ∪ best-M` ≈ ~1 TB.
 5. **HF private storage:** free 100 GB / PRO 1 TB; full ckpt ≈ 130 GB, model-only ≈ 25 GB.
+6. **Eval rendering on a busy multi-GPU node.** MuJoCo **EGL** rendering aborts (SIGABRT, exit 134)
+   when its GPU is saturated: on the default device 0 (training) it dies at env creation; co-located
+   with the policy server on the spare GPU it dies on the **2nd episode** (EGL + the server's CUDA
+   context on the same device is unstable across episodes). Fix: render on **CPU via OSMesa** —
+   `apt-get install -y libosmesa6` and run the client with `MUJOCO_GL=osmesa`. The watcher
+   (`scripts/eval/watch_eval_libero.sh`) **defaults to `MUJOCO_GL_BACKEND=osmesa`** for this reason;
+   only set `MUJOCO_GL_BACKEND=egl` if you have a fully-idle GPU dedicated to rendering. (The watcher
+   also pins EGL to `SERVER_GPU` when EGL is used.) OSMesa adds a little CPU per render but eval is
+   inference-bound, so wall-clock is ~unchanged.
 
 ## 10.8 Reproduction checklist (this iteration)
 

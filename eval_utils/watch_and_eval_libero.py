@@ -313,6 +313,10 @@ def run_client(args, step, eval_out_root) -> str | None:
     os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
     env = os.environ.copy()
     env["MUJOCO_GL"] = args.mujoco_gl
+    if args.mujoco_gl == "egl":
+        # Pin EGL rendering to the dedicated eval GPU. The default EGL device 0 may be saturated by
+        # training on a busy multi-GPU node, which makes MuJoCo abort (SIGABRT / exit -6).
+        env["MUJOCO_EGL_DEVICE_ID"] = str(args.server_gpu)
     cmd = [
         args.libero_python, "eval_utils/run_libero_eval.py",
         "--host", "127.0.0.1", "--port", str(args.port),

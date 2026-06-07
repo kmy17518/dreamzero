@@ -193,11 +193,12 @@ class HfUploader(threading.Thread):
     on evict). Updates the `uploaded` set + state via the provided callbacks."""
 
     def __init__(self, repo_id, repo_type, model_only, private, token,
-                 mark_uploaded, mark_deleted):
+                 mark_uploaded, mark_deleted, squash_history=False):
         super().__init__(daemon=True)
         self.repo_id = repo_id
         self.repo_type = repo_type
         self.model_only = model_only
+        self.squash_history = squash_history
         self.mark_uploaded = mark_uploaded
         self.mark_deleted = mark_deleted
         self.q: "queue.Queue" = queue.Queue()
@@ -214,6 +215,18 @@ class HfUploader(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+    def _squash_history(self):
+        # A Hub repo's storage quota counts LFS blobs in *history*, so delete_folder alone does NOT
+        # reclaim space (the evicted checkpoint blob lingers in past commits). super_squash collapses
+        # the branch to a single commit, dropping those orphaned blobs. Best-effort / non-fatal.
+        try:
+            self.api.super_squash_history(
+                repo_id=self.repo_id, repo_type=self.repo_type,
+                commit_message="squash mirror history (reclaim deleted-checkpoint storage)")
+            log(f"upload: squashed Hub history for {self.repo_id} (reclaimed evicted-blob storage)")
+        except Exception as e:  # noqa: BLE001
+            log(f"upload: super_squash_history failed (non-fatal): {e}")
 
     def run(self):
         while not self._stop.is_set():
@@ -248,6 +261,10 @@ class HfUploader(threading.Thread):
                         log(f"upload: delete checkpoint-{step} (likely already gone): {e}")
                     self.mark_deleted(step)
                     log(f"upload: removed checkpoint-{step} from {self.repo_id}")
+                    # Reclaim the evicted blob's storage once the queue drains (batches consecutive
+                    # evictions into a single squash).
+                    if self.squash_history and self.q.empty():
+                        self._squash_history()
             except Exception as e:  # noqa: BLE001
                 log(f"upload: FAILED {action} checkpoint-{step}: {e}")
             finally:
@@ -379,6 +396,9 @@ def main():
                     help="upload model-only (no optimizer) to the Hub -- much smaller/faster "
                          "(default uploads the full, resumable checkpoint)")
     ap.add_argument("--upload-public", action="store_true", help="make the Hub repo public (default private)")
+    ap.add_argument("--squash-history", action="store_true",
+                    help="after each eviction, super-squash the Hub repo history so deleted checkpoint "
+                         "blobs stop counting against the (private) storage quota")
     args = ap.parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
@@ -425,6 +445,7 @@ def main():
             model_only=args.upload_model_only, private=not args.upload_public,
             token=os.environ.get("HF_TOKEN"),
             mark_uploaded=_mark_uploaded, mark_deleted=_mark_deleted,
+            squash_history=args.squash_history,
         )
         uploader.start()
 

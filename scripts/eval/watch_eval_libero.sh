@@ -26,6 +26,9 @@ EXTRA=()
 # share one *live* run (the second writer's points are silently dropped). Set SEPARATE_RUN=0 to
 # attempt same-run logging (not recommended).
 [ "${SEPARATE_RUN:-1}" = "1" ] && EXTRA+=(--separate-run)
+# After evicting checkpoints, squash the HF repo history so storage isn't held by old blobs in
+# history (private quota counts history). On by default; set SQUASH_HISTORY=0 to disable.
+[ "${SQUASH_HISTORY:-1}" = "0" ] && EXTRA+=(--no-squash-history)
 
 exec python eval_utils/watch_and_eval_libero.py \
     --output-dir "$OUTPUT_DIR" \

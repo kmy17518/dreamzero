@@ -248,6 +248,17 @@ class HfUploader(threading.Thread):
                         log(f"upload: delete checkpoint-{step} (likely already gone): {e}")
                     self.mark_deleted(step)
                     log(f"upload: removed checkpoint-{step} from {self.repo_id}")
+                elif action == "squash":
+                    # Evictions only drop files from HEAD; their blobs stay in the commit history
+                    # and keep counting against the (private) storage quota. Squashing history to a
+                    # single commit lets the Hub reclaim the orphaned blobs.
+                    log(f"upload: squashing commit history of {self.repo_id} to reclaim storage")
+                    self.api.super_squash_history(
+                        repo_id=self.repo_id,
+                        repo_type=self.repo_type,
+                        commit_message="squash history (reclaim storage from evicted checkpoints)",
+                    )
+                    log(f"upload: squashed history of {self.repo_id}")
             except Exception as e:  # noqa: BLE001
                 log(f"upload: FAILED {action} checkpoint-{step}: {e}")
             finally:
@@ -382,6 +393,12 @@ def main():
                     help="upload model-only (no optimizer) to the Hub -- much smaller/faster "
                          "(default uploads the full, resumable checkpoint)")
     ap.add_argument("--upload-public", action="store_true", help="make the Hub repo public (default private)")
+    ap.add_argument("--squash-history", dest="squash_history", action="store_true", default=True,
+                    help="after evicting checkpoints, squash the Hub repo's commit history so the "
+                         "(private) storage quota reflects only the current files -- otherwise the "
+                         "evicted blobs linger in history and keep counting. Destructive to history "
+                         "(fine for a best/latest mirror).")
+    ap.add_argument("--no-squash-history", dest="squash_history", action="store_false")
     args = ap.parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
@@ -434,7 +451,8 @@ def main():
     log(f"watching {output_dir} | server-gpu={args.server_gpu} | suite={args.task_suite_name} "
         f"trials/task={args.num_trials_per_task} max_tasks={args.max_tasks or 'all'} | "
         f"latest_only={args.latest_only} | keep_latest={args.keep_latest_n} keep_best={args.keep_best_n}"
-        + (f" | upload->{args.upload_repo} (best-{args.upload_best_n} + latest)" if uploader else ""))
+        + (f" | upload->{args.upload_repo} (best-{args.upload_best_n} + latest"
+           f"{', squash-on-evict' if args.squash_history else ''})" if uploader else ""))
 
     def sync_uploads(best_steps):
         if uploader is None:
@@ -454,8 +472,15 @@ def main():
             src = os.path.join(output_dir, f"checkpoint-{s}")
             if os.path.isdir(src):
                 uploader.enqueue("up", s, src)
-        for s in sorted(uploaded - upload_set):
+        evicted = sorted(uploaded - upload_set)
+        for s in evicted:
             uploader.enqueue("del", s)
+        # Evictions only remove a checkpoint from HEAD; its blobs remain in the commit history and
+        # keep counting against the (private) HF storage quota. Squash history after evictions so
+        # the quota reflects only the current files. Queued after the "del"s so it squashes to the
+        # post-eviction HEAD.
+        if evicted and args.squash_history:
+            uploader.enqueue("squash", -1)
 
     try:
         while True:

@@ -197,7 +197,8 @@ class CausalWanSelfAttention(nn.Module):
                  qk_norm=True,
                  eps=1e-6,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 action_attend_obs_only=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -212,6 +213,9 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_seqlen = frame_seqlen
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
+        # Ablation flag: when True, action/state register attends only to the clean current
+        # observation (first frame) + its own register, NOT the to-be-generated video blocks.
+        self.action_attend_obs_only = action_attend_obs_only
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -280,13 +284,14 @@ class CausalWanSelfAttention(nn.Module):
             # Attend to first image
             mask[action_block_start:action_block_end, first_image_start:first_image_end] = True
             
-            # Attend to previous and current image blocks
-            image_block_end = image_blocks_start + (block_idx + 1) * num_frame_per_block * frame_seqlen
-            if self.local_attn_size != -1:
-                image_kv_start = max(image_blocks_start, image_block_end - self.local_attn_size * frame_seqlen)
-            else:
-                image_kv_start = image_blocks_start
-            mask[action_block_start:action_block_end, image_kv_start:image_block_end] = True
+            # Attend to previous and current image blocks (skipped when obs-only ablation is on)
+            if not self.action_attend_obs_only:
+                image_block_end = image_blocks_start + (block_idx + 1) * num_frame_per_block * frame_seqlen
+                if self.local_attn_size != -1:
+                    image_kv_start = max(image_blocks_start, image_block_end - self.local_attn_size * frame_seqlen)
+                else:
+                    image_kv_start = image_blocks_start
+                mask[action_block_start:action_block_end, image_kv_start:image_block_end] = True
             
             # Self-attention
             mask[action_block_start:action_block_end, action_block_start:action_block_end] = True
@@ -522,18 +527,31 @@ class CausalWanSelfAttention(nn.Module):
                 image_kv_start = image_blocks_start
             
             # Build context
-            k_context = torch.cat([
-                k[:, first_image_start:first_image_end],  # First image
-                k[:, image_kv_start:image_block_end],  # Image blocks
-                k[:, action_block_start:action_block_end],  # Current action block
-                k[:, state_block_start:state_block_end]  # Current state block
-            ], dim=1)
-            v_context = torch.cat([
-                v[:, first_image_start:first_image_end],
-                v[:, image_kv_start:image_block_end],
-                v[:, action_block_start:action_block_end],
-                v[:, state_block_start:state_block_end]
-            ], dim=1)
+            if self.action_attend_obs_only:
+                # Ablation: action attends only to first image (current obs) + own action/state.
+                k_context = torch.cat([
+                    k[:, first_image_start:first_image_end],  # First image (current obs)
+                    k[:, action_block_start:action_block_end],  # Current action block
+                    k[:, state_block_start:state_block_end]  # Current state block
+                ], dim=1)
+                v_context = torch.cat([
+                    v[:, first_image_start:first_image_end],
+                    v[:, action_block_start:action_block_end],
+                    v[:, state_block_start:state_block_end]
+                ], dim=1)
+            else:
+                k_context = torch.cat([
+                    k[:, first_image_start:first_image_end],  # First image
+                    k[:, image_kv_start:image_block_end],  # Image blocks
+                    k[:, action_block_start:action_block_end],  # Current action block
+                    k[:, state_block_start:state_block_end]  # Current state block
+                ], dim=1)
+                v_context = torch.cat([
+                    v[:, first_image_start:first_image_end],
+                    v[:, image_kv_start:image_block_end],
+                    v[:, action_block_start:action_block_end],
+                    v[:, state_block_start:state_block_end]
+                ], dim=1)
             
             output[:, action_block_start:action_block_end] = self.attn(
                 q[:, action_block_start:action_block_end], k_context, v_context
@@ -765,19 +783,35 @@ class CausalWanSelfAttention(nn.Module):
             
             q_block = noisy_action_q[:, action_start:action_end]
             
-            # Build context: first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
-            k_context = torch.cat([
-                clean_image_k[:, :clean_end],
-                noisy_image_k[:, noisy_img_start:noisy_img_end],
-                noisy_action_k[:, action_start:action_end],
-                noisy_state_k[:, state_start:state_end]
-            ], dim=1)
-            v_context = torch.cat([
-                clean_image_v[:, :clean_end],
-                noisy_image_v[:, noisy_img_start:noisy_img_end],
-                noisy_action_v[:, action_start:action_end],
-                noisy_state_v[:, state_start:state_end]
-            ], dim=1)
+            if self.action_attend_obs_only:
+                # Ablation: action attends ONLY to the clean current observation (first frame)
+                # + its own action/state register. Drops all future video (clean teacher-forced
+                # blocks AND the current noisy image block) -> removes the train/inference
+                # mismatch that arises when the video (dynamics) loss is not optimized.
+                k_context = torch.cat([
+                    clean_image_k[:, :self.frame_seqlen],
+                    noisy_action_k[:, action_start:action_end],
+                    noisy_state_k[:, state_start:state_end]
+                ], dim=1)
+                v_context = torch.cat([
+                    clean_image_v[:, :self.frame_seqlen],
+                    noisy_action_v[:, action_start:action_end],
+                    noisy_state_v[:, state_start:state_end]
+                ], dim=1)
+            else:
+                # Build context: first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
+                k_context = torch.cat([
+                    clean_image_k[:, :clean_end],
+                    noisy_image_k[:, noisy_img_start:noisy_img_end],
+                    noisy_action_k[:, action_start:action_end],
+                    noisy_state_k[:, state_start:state_end]
+                ], dim=1)
+                v_context = torch.cat([
+                    clean_image_v[:, :clean_end],
+                    noisy_image_v[:, noisy_img_start:noisy_img_end],
+                    noisy_action_v[:, action_start:action_end],
+                    noisy_state_v[:, state_start:state_end]
+                ], dim=1)
             
             output[:, action_start:action_end] = self.attn(q_block, k_context, v_context)
         
@@ -1068,16 +1102,39 @@ class CausalWanSelfAttention(nn.Module):
             new_k = torch.cat([updated_k, roped_key], dim=1)
             new_v = torch.cat([updated_v, v], dim=1)
 
+            # Capture the first frame (clean current observation) BEFORE truncation so the action
+            # register can attend to it even if the rolling KV cache later evicts it. The video
+            # KV cache is reseeded with the current obs as frame 0 every `local_attn_size` frames
+            # (see the current_start_frame reset), so this is the current observation.
+            obs_k = new_k[:, :self.frame_seqlen]
+            obs_v = new_v[:, :self.frame_seqlen]
+
             # We may need to truncate the KV cache if it's size is larger than the max attention size.
             new_k = new_k[:, -self.max_attention_size:]
             new_v = new_v[:, -self.max_attention_size:]
 
             if action_register_length is not None:
-                x = self.attn(
-                    torch.cat([roped_query, roped_action_query], dim=1),
-                    torch.cat([new_k, roped_action_key], dim=1),
-                    torch.cat([new_v, action_v], dim=1),
-                )
+                if self.action_attend_obs_only:
+                    # Image stream: unchanged (attends to the rolling video cache + action register).
+                    x_img = self.attn(
+                        roped_query,
+                        torch.cat([new_k, roped_action_key], dim=1),
+                        torch.cat([new_v, action_v], dim=1),
+                    )
+                    # Action/state register: attend ONLY to the clean current observation (first
+                    # frame) + its own register. No generated/future video tokens.
+                    x_act = self.attn(
+                        roped_action_query,
+                        torch.cat([obs_k, roped_action_key], dim=1),
+                        torch.cat([obs_v, action_v], dim=1),
+                    )
+                    x = torch.cat([x_img, x_act], dim=1)
+                else:
+                    x = self.attn(
+                        torch.cat([roped_query, roped_action_query], dim=1),
+                        torch.cat([new_k, roped_action_key], dim=1),
+                        torch.cat([new_v, action_v], dim=1),
+                    )
             else:
                 x = self.attn(
                     roped_query,
@@ -1108,7 +1165,8 @@ class CausalWanAttentionBlock(nn.Module):
                  cross_attn_norm=False,
                  eps=1e-6,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 action_attend_obs_only=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1131,6 +1189,7 @@ class CausalWanAttentionBlock(nn.Module):
             eps=eps,
             num_action_per_block=num_action_per_block,
             num_state_per_block=num_state_per_block,
+            action_attend_obs_only=action_attend_obs_only,
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -1290,7 +1349,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  diffusion_model_pretrained_path=None,
                  num_action_per_block=32,
                  num_state_per_block=1,
-                 concat_first_frame_latent=True):
+                 concat_first_frame_latent=True,
+                 action_attend_obs_only=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1361,6 +1421,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.concat_first_frame_latent = concat_first_frame_latent
+        # Ablation: action/state register attends only to the clean current observation (first
+        # frame) + own register, not the (untrained, to-be-generated) future video blocks.
+        self.action_attend_obs_only = action_attend_obs_only
 
         max_num_embodiments = 1
 
@@ -1399,7 +1462,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, frame_seqlen,
                                     self.local_attn_size, sink_size, num_frame_per_block, qk_norm, cross_attn_norm, eps,
-                                    num_action_per_block, num_state_per_block)
+                                    num_action_per_block, num_state_per_block, action_attend_obs_only)
             for _ in range(num_layers)
         ])
 

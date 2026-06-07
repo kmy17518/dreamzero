@@ -933,3 +933,116 @@ OUTPUT_DIR=/root/dreamzero/checkpoints/dreamzero_libero_wan22_decoupled SERVER_G
 [ ]   sanity: "Using PYTHONPATH: /root/libero_al_dl_decoupled"; config.json has decouple_action_dynamics=true  # §12.1
 [ ] eval (standard path): serve --model_path ...wan22_decoupled --port 8002 + sim client               # §12.2
 ```
+
+---
+
+# 13. Fully (bidirectionally) decoupled action/dynamics variant (video ALSO does not attend to action)
+
+This extends §12. §12 cuts the **action → generated-video** attention edge (action tokens can't peek
+at the noisy/being-generated video). This §13 variant **additionally** cuts the mirror edge
+**generated-video → action**: the noisy / being-generated video ("dynamics") tokens are prevented
+from attending to the action block. Both pathways still attend to the **clean observation context**
+(current + past frames) and their own **state** block, so after enabling both gates the action and
+video pathways share **only the real observations + state** — there is no cross-talk between the
+predicted action and the being-generated video in **either** direction. As in §12, **both**
+flow-matching losses are still optimized jointly (`train/dynamics_loss` **and** `train/action_loss`);
+only the self-attention bridges between the two predicted modalities are removed.
+
+> **How this differs from §12.** §12 sets only `decouple_action_dynamics` (one direction). §13 adds
+> the new flag `decouple_dynamics_action` on top, so **both** directions are cut. The two flags are
+> orthogonal and both default to off, so §6/§10 (joint/coupled), §11 (action-loss-only), and §12
+> (one-directional decoupled) are all completely unaffected. Note we cut only video→**action**; the
+> video keeps attending to the **state** tokens (state is a real observation, not a predicted
+> action), consistent across the training, inference, and blockwise paths.
+
+> **IMPORTANT modeling caveat.** With `decouple_dynamics_action` on, the video model can no longer
+> condition its next-frame prediction on the action, i.e. it becomes an **action-UNCONDITIONED**
+> video predictor (it predicts a marginal/default future rather than the action-conditioned one), and
+> the dynamics loss no longer back-props into the action tokens at all. If you want the video to stay
+> an **action-conditioned world model**, use the one-directional §12 variant instead.
+
+**What was added** (same branch `libero_al_dl_decoupled`; builds directly on §12):
+
+| Area | File / change |
+|---|---|
+| Attention gate | `groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py` — new flag `decouple_dynamics_action` (default `false`) threaded `CausalWanModel` → `CausalWanAttentionBlock` → `CausalWanSelfAttention`. When `true`, the **video** block's K/V context **drops the action tokens** (keeping clean obs + current noisy block + state) in (a) the training teacher-forcing path (`_process_noisy_image_blocks`), (b) the inference KV-cache path (video attends to cached obs + current noisy block + the **state** part of the register, not the action part), and (c) the `_blockwise_causal_flash_attn` image loop + debug mask (for completeness). Default `false` = original joint attention. Mirror of `decouple_action_dynamics` (§12). |
+| Action-head config | `groot/vla/configs/model/dreamzero/action_head/wan_flow_matching_action_tf_wan22_decoupled_bidir.yaml` (inherits `wan_flow_matching_action_tf_wan22_decoupled`, which already sets `decouple_action_dynamics: true`, and adds `decouple_dynamics_action: true` → **both** gates on). |
+| Training launcher | `scripts/train/libero_training_wan22_decoupled_bidir.sh` (selects the new head; separate default `OUTPUT_DIR=...wan22_decoupled_bidir`; auto-exports `PYTHONPATH=$DREAMZERO_ROOT`). |
+| Unit test | `scripts/test_decouple_action_dynamics.py` — added `test_dynamics_action_decoupled_training` / `test_dynamics_action_decoupled_inference`, proving the **video** output is bitwise-independent of the action tokens yet still depends on the state, for both the train and inference paths (the §12 action→video checks still run too). |
+
+> **Why the launcher sets `PYTHONPATH`** and **why eval needs no special flag**: identical to §12 —
+> the flags live on the diffusion-model config, are persisted in the checkpoint's `config.json`, and
+> are rebuilt automatically when the policy server loads the model.
+
+## 13.1 Train
+
+```bash
+# (1) conda + secrets (same as §12.1).
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate dreamzero
+cd /root/libero_al_dl_decoupled
+set -a; . /root/dreamzero/.env; set +a
+
+# (2) launch as ONE line. Distinct WANDB_RUN_ID + its own OUTPUT_DIR so it never collides with the
+#     joint-loss (§10), action-loss-only (§11), or one-directional decoupled (§12) runs.
+WANDB_RUN_ID=dreamzero_libero_wan22_decoupled_bidir NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 SAVE_TOTAL_LIMIT=100000 OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22_decoupled_bidir LIBERO_DATA_ROOT=$PWD/data/libero_lerobot PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=100000 SAVE_STEPS=1000 SAVE_STRATEGY=steps TRAIN_ARCH=full PYTHON_BIN=$(which python) bash scripts/train/libero_training_wan22_decoupled_bidir.sh
+```
+
+- **GPU placement / isolation / bs=1 / resume:** identical to §12.1 (use `NUM_GPUS=1
+  CUDA_VISIBLE_DEVICES=7` to coexist with a run on GPUs 0–6; `--standalone` picks a random port;
+  `OUTPUT_DIR` is a separate sub-dir; just keep `WANDB_RUN_ID` distinct).
+- **Sanity-check it's the bidirectional variant:** the launcher prints `Using PYTHONPATH:
+  /root/libero_al_dl_decoupled`, the experiment prints `Run name:
+  dreamzero_libero_wan22_decoupled_bidir`, and the saved `checkpoint-*/config.json` contains **both**
+  `"decouple_action_dynamics": true` **and** `"decouple_dynamics_action": true` inside
+  `diffusion_model_cfg`. As in §12, **both** `train/loss` components are optimized
+  (`train/loss ≈ train/dynamics_loss + train/action_loss`).
+- **Optional offline check of the attention behavior** (no GPU / no base weights needed):
+  ```bash
+  PYTHONPATH=/root/libero_al_dl_decoupled ATTENTION_BACKEND=torch \
+      python scripts/test_decouple_action_dynamics.py
+  ```
+  It now asserts both directions: with each flag on, the gated side's output is
+  **bitwise-independent** of the other modality (train + inference) while still depending on the
+  clean observation / state.
+
+## 13.2 Eval
+
+Both flags are baked into the checkpoint's `config.json`, so eval uses the **standard** LIBERO eval
+path (§7/§10.5/§12.2) pointed at the bidirectional-decoupled checkpoint. Use a **different `--port` /
+`--video-out-path`** than any concurrent eval.
+
+Terminal A — policy server (GPU, `dreamzero`):
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero
+cd /root/dreamzero && set -a; . ./.env; set +a
+CUDA_VISIBLE_DEVICES=7 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/dreamzero_libero_wan22_decoupled_bidir \
+    --embodiment_tag libero_sim --tokenizer_path ./checkpoints/umt5-xxl --port 8003
+```
+
+Terminal B — sim client (CPU, `dreamzero_libero`):
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate dreamzero_libero
+cd /root/dreamzero
+MUJOCO_GL=egl python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8003 --task-suite-name libero_spatial \
+    --num-trials-per-task 50 \
+    --video-out-path ./eval_outputs/libero_spatial_decoupled_bidir/videos
+```
+
+- **Automatic eval+upload watcher (§10.4)** also works: point `OUTPUT_DIR` at the bidir dir, pick a
+  spare `SERVER_GPU`, use a **separate** `UPLOAD_REPO`, and pass
+  `--wandb-run-id dreamzero_libero_wan22_decoupled_bidir`.
+
+## 13.3 Reproduction checklist (fully decoupled)
+
+```text
+[ ] conda activate dreamzero; cd /root/libero_al_dl_decoupled; set -a; . /root/dreamzero/.env; set +a  # §13.1
+[ ] (optional) PYTHONPATH=$PWD ATTENTION_BACKEND=torch python scripts/test_decouple_action_dynamics.py # §13.1
+[ ] train via scripts/train/libero_training_wan22_decoupled_bidir.sh (single line)                      # §13.1
+[ ]   distinct WANDB_RUN_ID + OUTPUT_DIR=...wan22_decoupled_bidir                                       # §13.1
+[ ]   GPUs: free node NUM_GPUS=8 | coexist w/ run on 0-6 -> NUM_GPUS=1 CUDA_VISIBLE_DEVICES=7           # §13.1
+[ ]   sanity: config.json has decouple_action_dynamics=true AND decouple_dynamics_action=true           # §13.1
+[ ] eval (standard path): serve --model_path ...wan22_decoupled_bidir --port 8003 + sim client          # §13.2
+```

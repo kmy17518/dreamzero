@@ -1,0 +1,29 @@
+# @package _global_
+# Fully (bidirectionally) decoupled action/dynamics variant of the Wan2.2-TI2V-5B action head.
+# Builds on wan_flow_matching_action_tf_wan22_decoupled (which already sets
+# decouple_action_dynamics: true, so ACTION tokens do not attend to the noisy/generated video) and
+# ADDS decouple_dynamics_action: true, so the noisy/generated video ("dynamics") tokens also do NOT
+# attend to the action block. The net effect: the action and video pathways share ONLY the clean
+# observation context (current + past frames) and their own state block -- there is no cross-talk
+# between the predicted action and the being-generated video in either direction.
+#
+# Both flow-matching losses (dynamics/video AND action) are still optimized jointly; this only cuts
+# the self-attention bridges between the two predicted modalities.
+#
+# IMPORTANT modeling note: with decouple_dynamics_action on, the video model can no longer condition
+# its next-frame prediction on the action, so it becomes an action-UNCONDITIONED video predictor.
+# If you want the video model to remain an action-conditioned world model, leave this flag off and
+# use wan_flow_matching_action_tf_wan22_decoupled instead.
+#
+# Both flags live on the diffusion model config, so they are persisted in the checkpoint's
+# config.json and applied automatically at eval (no eval flag needed).
+#
+# Select with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_decoupled_bidir
+
+defaults:
+  - wan_flow_matching_action_tf_wan22_decoupled
+
+action_head_cfg:
+  config:
+    diffusion_model_cfg:
+      decouple_dynamics_action: true

@@ -177,8 +177,119 @@ def test_inference_kv_cache() -> None:
     print("  -> inference kv-cache path OK\n")
 
 
+def test_dynamics_action_decoupled_training() -> None:
+    """Mirror gate (`decouple_dynamics_action`): with the flag ON, the VIDEO output must NOT depend
+    on the action tokens, but MUST still depend on the state tokens (we only cut video->action, not
+    video->state). With the flag OFF, the video depends on the action (original joint behavior)."""
+    attn = build_attn()
+
+    num_image_blocks = (NOISY_FRAMES - 1) // NUM_FRAME_PER_BLOCK
+    seq_len_video = NOISY_FRAMES * FRAME_SEQLEN
+    action_horizon = num_image_blocks * NUM_ACTION_PER_BLOCK
+    state_horizon = num_image_blocks * NUM_STATE_PER_BLOCK
+    R = action_horizon + state_horizon
+    s = 2 * seq_len_video + R  # [clean video | noisy video | action register | state register]
+
+    freqs = video_freqs(seq_len_video)
+    freqs_action = rope_params(1024 * 10, HEAD_DIM)
+    freqs_state = rope_params(1024, HEAD_DIM)
+
+    base_x = torch.randn(B, s, DIM)
+
+    noisy_sl = slice(seq_len_video, 2 * seq_len_video)
+    # Register layout is [action | state]; perturb each part independently.
+    action_sl = slice(2 * seq_len_video, 2 * seq_len_video + action_horizon)
+    state_sl = slice(2 * seq_len_video + action_horizon, s)
+
+    def run(x, decouple_dyn_act):
+        attn.decouple_action_dynamics = False
+        attn.decouple_dynamics_action = decouple_dyn_act
+        with torch.no_grad():
+            out, _ = attn(
+                x=x, freqs=freqs, freqs_action=freqs_action, freqs_state=freqs_state,
+                action_register_length=R, kv_cache=None, is_tf=True,
+            )
+        return out
+
+    x_perturb_action = base_x.clone()
+    x_perturb_action[:, action_sl] += 5.0
+    x_perturb_state = base_x.clone()
+    x_perturb_state[:, state_sl] += 5.0
+
+    for dv in (False, True):
+        base = run(base_x, dv)
+        d_action = max_abs_diff(run(x_perturb_action, dv)[:, noisy_sl], base[:, noisy_sl])
+        d_state = max_abs_diff(run(x_perturb_state, dv)[:, noisy_sl], base[:, noisy_sl])
+        tag = "DECOUPLED" if dv else "coupled  "
+        print(f"[train/dyn-act {tag}] video depends on action: {d_action:.4f} | "
+              f"video depends on state: {d_state:.4f}")
+        if dv:
+            assert d_action < 1e-6, f"DECOUPLED: video must NOT see action (got {d_action})"
+        else:
+            assert d_action > 1e-2, f"coupled: video should see action (got {d_action})"
+        # In both modes the video must still attend to the state tokens.
+        assert d_state > 1e-2, f"video must still attend to state (got {d_state})"
+
+    print("  -> training dynamics->action decoupling OK\n")
+
+
+def test_dynamics_action_decoupled_inference() -> None:
+    attn = build_attn()
+
+    R = NUM_ACTION_PER_BLOCK + NUM_STATE_PER_BLOCK   # inference register == one block
+    num_new = NUM_FRAME_PER_BLOCK * FRAME_SEQLEN
+    cache_len = 2 * FRAME_SEQLEN
+    s = num_new + R
+    current_start_frame = 1
+
+    freqs = video_freqs(num_new)
+    freqs_action = rope_params(1024 * 10, HEAD_DIM)
+    freqs_state = rope_params(1024, HEAD_DIM)
+
+    base_x = torch.randn(B, s, DIM)
+    kv_cache = torch.randn(2, B, cache_len, NUM_HEADS, HEAD_DIM)
+
+    video_out_sl = slice(0, num_new)
+    # Register layout is [action | state].
+    action_sl = slice(num_new, num_new + NUM_ACTION_PER_BLOCK)
+    state_sl = slice(num_new + NUM_ACTION_PER_BLOCK, s)
+
+    def run(x, decouple_dyn_act):
+        attn.decouple_action_dynamics = False
+        attn.decouple_dynamics_action = decouple_dyn_act
+        with torch.no_grad():
+            out, _ = attn(
+                x=x, freqs=freqs, freqs_action=freqs_action, freqs_state=freqs_state,
+                action_register_length=R, kv_cache=kv_cache.clone(),
+                current_start_frame=current_start_frame, is_tf=False,
+            )
+        return out
+
+    x_perturb_action = base_x.clone()
+    x_perturb_action[:, action_sl] += 5.0
+    x_perturb_state = base_x.clone()
+    x_perturb_state[:, state_sl] += 5.0
+
+    for dv in (False, True):
+        base = run(base_x, dv)
+        d_action = max_abs_diff(run(x_perturb_action, dv)[:, video_out_sl], base[:, video_out_sl])
+        d_state = max_abs_diff(run(x_perturb_state, dv)[:, video_out_sl], base[:, video_out_sl])
+        tag = "DECOUPLED" if dv else "coupled  "
+        print(f"[infer/dyn-act {tag}] video depends on action: {d_action:.4f} | "
+              f"video depends on state: {d_state:.4f}")
+        if dv:
+            assert d_action < 1e-6, f"DECOUPLED: video must NOT see action (got {d_action})"
+        else:
+            assert d_action > 1e-2, f"coupled: video should see action (got {d_action})"
+        assert d_state > 1e-2, f"video must still attend to state (got {d_state})"
+
+    print("  -> inference dynamics->action decoupling OK\n")
+
+
 if __name__ == "__main__":
     print(f"torch={torch.__version__} ATTENTION_BACKEND={os.environ.get('ATTENTION_BACKEND')}\n")
     test_training_teacher_forcing()
     test_inference_kv_cache()
+    test_dynamics_action_decoupled_training()
+    test_dynamics_action_decoupled_inference()
     print("ALL CHECKS PASSED")

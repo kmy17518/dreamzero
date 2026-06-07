@@ -143,6 +143,21 @@ class WANPolicyHeadConfig(PretrainedConfig):
     use_vlln: bool = field(default=True)
     defer_lora_injection: bool = field(default=False, metadata={"help": "Defer LoRA injection until after loading pretrained weights."})
 
+    # Explicit-conditioning "future-frame shift". When enabled the joint DiT predicts the video
+    # block one step ahead of the action/state it is grouped with: register slot b becomes
+    # (video o_b, action a_{b-1}, state s_{b-1}) instead of the aligned (o_b, a_b, s_b). The video
+    # diffusion pipeline is untouched; only the action/state register is rolled back
+    # `future_frame_shift_blocks` block(s) and the now-unsupervised leading block(s) are masked
+    # out of the action loss. See docs/LIBERO_EXPLICIT_CONDITIONING.md.
+    future_frame_shift: bool = field(
+        default=False,
+        metadata={"help": "Predict video one block ahead of the action/state (explicit conditioning)."},
+    )
+    future_frame_shift_blocks: int = field(
+        default=1,
+        metadata={"help": "Number of blocks the video leads the action/state by (default 1)."},
+    )
+
     vl_self_attention_cfg: dict = field(default=None)
     text_encoder_cfg: dict = field(default=None)
     image_encoder_cfg: dict = field(default=None)
@@ -617,6 +632,32 @@ class WANPolicyHead(ActionHead):
         # assert the values of action is in between -1 and 1
         if actions.numel() > 0:
             assert actions.min() >= -1.0 and actions.max() <= 1.0, "actions must be in [-1,1] range"
+
+        # ===== Explicit-conditioning future-frame shift =====
+        # Roll the action+state register back `shift_blocks` block(s) so the model predicts the
+        # video block one step ahead of the action/state it co-produces:
+        #     register slot b -> (video o_b, action a_{b-1}, state s_{b-1})   (here shift=1)
+        # Equivalent to "shifting the video timestep into the future" relative to the action.
+        # The video diffusion target is left untouched; we only reindex the action/state tensors
+        # and mask the leading block(s) (a_{-1}, s_{-1}) which have no valid target.
+        if getattr(self.config, "future_frame_shift", False):
+            shift_blocks = int(getattr(self.config, "future_frame_shift_blocks", 1))
+            if shift_blocks > 0:
+                if actions.numel() > 0:
+                    n_act = shift_blocks * self.model.num_action_per_block  # action tokens / block
+                    assert n_act < actions.shape[1], (
+                        f"future_frame_shift_blocks={shift_blocks} too large for "
+                        f"{actions.shape[1] // self.model.num_action_per_block} action blocks"
+                    )
+                    actions = torch.roll(actions, shifts=n_act, dims=1)
+                    actions[:, :n_act] = 0.0  # discard the wrapped-around last block(s)
+                    action_mask = torch.roll(action_mask, shifts=n_act, dims=1)
+                    action_mask[:, :n_act] = False  # leading block(s) unsupervised (a_{-1})
+                # one state token per block -> roll along the block (time) axis
+                if state_features.numel() > 0 and state_features.shape[1] > shift_blocks:
+                    state_features = torch.roll(state_features, shifts=shift_blocks, dims=1)
+                    state_features[:, :shift_blocks] = 0.0
+
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")

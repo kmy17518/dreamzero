@@ -41,6 +41,10 @@ MAX_STEPS=${MAX_STEPS:-100}
 TRAIN_ARCH=${TRAIN_ARCH:-full}          # 'full' (no LoRA) per the request; set 'lora' for LoRA
 SAVE_STRATEGY=${SAVE_STRATEGY:-steps}
 SAVE_STEPS=${SAVE_STEPS:-500}
+# Max checkpoints HF keeps (deletes older). When using the eval watcher's in-place retention
+# (latest-N + best-N), set this HIGH (e.g. 100000) so the watcher is the sole pruner and best
+# checkpoints aren't rotated away before/after they're evaluated.
+SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-5}
 SAVE_LORA_ONLY=${SAVE_LORA_ONLY:-false}  # only relevant if TRAIN_ARCH=lora
 
 # Wan2.2-TI2V-5B checkpoint (diffusion weights, T5 encoder, VAE)
@@ -90,7 +94,7 @@ cd "$DREAMZERO_ROOT"
     per_device_train_batch_size=$PER_DEVICE_BATCH_SIZE \
     max_steps=$MAX_STEPS \
     weight_decay=1e-5 \
-    save_total_limit=5 \
+    save_total_limit=$SAVE_TOTAL_LIMIT \
     upload_checkpoints=false \
     bf16=true \
     tf32=true \

@@ -6,13 +6,15 @@ checkpoint on a **single 80 GB GPU**, producing both the usual **binary success 
 **4 eval task suites** (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`) with
 **5 trials/task** and writes **detailed per-task metrics**.
 
-Assumes a fresh instance: **no conda env, no data, no checkpoints.** Eval needs only **(1) the
-checkpoint** and **(2) the umt5 tokenizer** — *no training dataset and no separate Wan backbone*
-(the fine-tuned checkpoint safetensors are self-contained; the `*_pretrained_path` entries in its
-`config.json` are vestigial and are **not** loaded at eval time). The action-loss-only and
-skip-noisy-video toggles are **baked into the checkpoint config** (`action_loss_only`,
-`action_skip_noisy_video`) and reconstructed automatically at serve time — the soft eval needs **no
-extra flags** for this variant.
+Assumes a fresh instance: **no conda env, no data, no checkpoints.** Eval needs **(1) the checkpoint**,
+**(2) the umt5 tokenizer**, and **HF access on the first serve** (to pull the Wan2.2/2.1 *encoder* base
+weights — T5/VAE/CLIP, ~16 GB, cached once and reused across checkpoints). Those encoder weights are
+immediately overwritten by the checkpoint's own weights, so **results are 100 % from the checkpoint**;
+the **DiT is never downloaded** (it is filled straight from the checkpoint via `skip_component_loading`,
+set in §2). **No training dataset.** The baked `*_pretrained_path` entries in `config.json` point at the
+training box (`/root/...`) and are ignored on a fresh instance. The action-loss-only and skip-noisy-video
+toggles are **baked into the checkpoint config** (`action_loss_only`, `action_skip_noisy_video`) and
+reconstructed automatically at serve time — no extra serve flags needed.
 
 > What "soft eval" adds: each task's BDDL goal is decomposed into ordered stages scored every sim step
 > from ground-truth state. Families: **pick-place** (`on`/`in` onto an object/container):
@@ -27,10 +29,13 @@ extra flags** for this variant.
 ## 0. Prereqs
 
 - **1 GPU with ≥ 80 GB** (any arch: H100/H200/A100-80G/B200/B300). Eval uses ~30–40 GB VRAM.
-- **CUDA 12.x toolkit** at `/usr/local/cuda` (provides `nvcc`), plus `git`, `tmux`.
-- **Headless MuJoCo rendering libs** (OSMesa = robust CPU rendering on a single GPU):
+- **`git`, `tmux`.** A **CUDA 12.x toolkit** at `/usr/local/cuda` (`nvcc`) is **optional** — only needed
+  to *compile* flash-attn or to run the *compiled* server. The default recipe below (prebuilt flash-attn
+  wheel + eager server) needs **no `nvcc`**, so a fresh box without a CUDA toolkit works as-is.
+- **Headless MuJoCo rendering libs** — EGL (fast GPU rendering, the default in §3) **and** OSMesa
+  (CPU fallback):
   ```bash
-  sudo apt-get update -y && sudo apt-get install -y libosmesa6 libgl1-mesa-glx libglfw3 patchelf
+  sudo apt-get update -y && sudo apt-get install -y libegl1 libgl1-mesa-glx libglfw3 libosmesa6 patchelf
   ```
 - **Clone the repo and check out the `libero_al_only` branch** (where this variant + the soft-eval
   code live). Pick any location; this guide uses `$HOME/dreamzero`:
@@ -70,15 +75,34 @@ conda create -n dreamzero python=3.11 -y -c conda-forge --override-channels
 conda activate dreamzero
 python -m ensurepip --upgrade            # conda-forge python ships without pip
 cd "$DZ"
-export CUDA_HOME=/usr/local/cuda && export PATH=$CUDA_HOME/bin:$PATH
+export CUDA_HOME=/usr/local/cuda && export PATH=$CUDA_HOME/bin:$PATH   # only for the optional compile paths; harmless if /usr/local/cuda is absent
 python -m pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129   # torch 2.8 cu129
-MAX_JOBS=96 python -m pip install --no-build-isolation flash-attn                     # usually a prebuilt wheel
+
+# flash-attn: install a PREBUILT wheel matching this torch/python/ABI — no CUDA toolkit / nvcc, no
+# ~15 min compile. (Plain `pip install flash-attn` tries to compile when it can't autodetect nvcc.)
+python - <<'PY'
+import torch, sys, subprocess
+FA  = "2.8.3"                                           # release that ships cu12 + torch2.8 wheels
+abi = "TRUE" if torch.compiled_with_cxx11_abi() else "FALSE"
+py  = f"cp{sys.version_info.major}{sys.version_info.minor}"
+url = (f"https://github.com/Dao-AILab/flash-attention/releases/download/v{FA}/"
+       f"flash_attn-{FA}+cu12torch2.8cxx11abi{abi}-{py}-{py}-linux_x86_64.whl")
+print("flash-attn wheel:", url)
+subprocess.check_call([sys.executable, "-m", "pip", "install", url])
+PY
+
+# DeepSpeed is a TRAIN-only dep, but `transformers` imports it at serve time and DeepSpeed's importer
+# calls nvcc/CUDA_HOME *just to import* — crashing the server on a box without a CUDA toolkit
+# ("CUDA_HOME does not exist"). Eval never uses DeepSpeed, so remove it:
+python -m pip uninstall -y deepspeed
+
 python -m pip install hf_transfer         # fast HF downloads
 ```
 > - **Do NOT** `pip install -U huggingface_hub` — `pip install -e .` pins a version with the `hf` CLI
 >   *and* `permanently_delete_lfs_files`; upgrading breaks `transformers`/`tokenizers`.
-> - **flash-attn on Blackwell:** if the prebuilt wheel tries to compile, force the arch first, e.g.
->   `TORCH_CUDA_ARCH_LIST="10.0+PTX"` (Hopper: `"9.0+PTX"`).
+> - **Have a CUDA toolkit and prefer to compile flash-attn?** `MAX_JOBS=96 python -m pip install
+>   --no-build-isolation flash-attn` (Blackwell: set `TORCH_CUDA_ARCH_LIST="10.0+PTX"` first; Hopper
+>   `"9.0+PTX"`). The prebuilt-wheel path above is simpler and needs no `nvcc`.
 
 ### 1b. Env `dreamzero_libero` — LIBERO MuJoCo sim client (CPU, py3.10)
 ```bash
@@ -138,28 +162,45 @@ hf download "$CKPT_REPO" \
     --exclude "checkpoint-$CKPT_STEP/global_step*/*" \
     --local-dir ./checkpoints/dreamzero_libero_al_only_eval
 
-# (c) umt5-xxl tokenizer (a few MB) — bundled inside the Wan2.2 backbone repo at google/umt5-xxl.
-#     The checkpoint's baked tokenizer_path is absolute and won't exist on a fresh box, so we pass
-#     --tokenizer_path explicitly in §3.
-hf download Wan-AI/Wan2.2-TI2V-5B --include "google/umt5-xxl/*" \
-    --local-dir ./checkpoints/Wan2.2-TI2V-5B
-mkdir -p ./checkpoints/umt5-xxl && cp ./checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl/* ./checkpoints/umt5-xxl/
+# (c) umt5-xxl tokenizer (a few MB) — bundled in the Wan2.2 repo at google/umt5-xxl. Download to a
+#     SCRATCH dir, NOT ./checkpoints/Wan2.2-TI2V-5B: that exact name is the checkpoint's baked
+#     diffusion_model_pretrained_path, and a tokenizer-only dir there makes serve crash with
+#     "No safetensors file found at .../Wan2.2-TI2V-5B/diffusion_pytorch_model.safetensors".
+hf download Wan-AI/Wan2.2-TI2V-5B --include "google/umt5-xxl/*" --local-dir ./checkpoints/_wan22_src
+mkdir -p ./checkpoints/umt5-xxl && cp ./checkpoints/_wan22_src/google/umt5-xxl/* ./checkpoints/umt5-xxl/
+rm -rf ./checkpoints/_wan22_src
+
+# (d) Make the DiT load straight from the checkpoint: set skip_component_loading=true in every
+#     downloaded checkpoint's config.json. Without it the server tries to (re)download the ~10 GB base
+#     Wan2.2 DiT (and crashes if a partial ./checkpoints/Wan2.2-TI2V-5B exists). The 5B DiT is already in
+#     the checkpoint safetensors, so this is loss-less and faster. (from_pretrained re-reads config.json
+#     from disk and ignores CLI overrides, so patch the file.)
+python - <<'PY'
+import json, glob
+for cfg in sorted(glob.glob("./checkpoints/dreamzero_libero_al_only_eval/checkpoint-*/config.json")):
+    d = json.load(open(cfg))
+    d["action_head_cfg"]["config"]["skip_component_loading"] = True
+    json.dump(d, open(cfg, "w"), indent=2)
+    print("patched", cfg)
+PY
 ```
-> **Why no backbone / dataset:** the fine-tuned checkpoint's safetensors contain *all* weights
-> (DiT + T5 text encoder + VAE + CLIP). The `diffusion/text/vae/image *_pretrained_path` fields in
-> `checkpoint-*/config.json` are only used when *training from the backbone*; at eval the modules are
-> constructed empty and then fully populated from the safetensors, so those paths are never read.
-> The action-loss-only / skip-noisy-video flags **are** read from the config (they only affect how
-> the action head attends — no extra weights), so the same checkpoint serves with the right variant
-> automatically. The only external artifact eval still needs is the **umt5 tokenizer** (to tokenize
-> the prompt).
+> **What serve loads:** the fine-tuned checkpoint's safetensors contain *all* final weights (DiT + T5 +
+> VAE + CLIP + action head). With `skip_component_loading=true` (step d) the DiT is built empty and
+> filled from the checkpoint — **no base-DiT download**. The T5/VAE/CLIP encoder *wrappers* still fetch
+> their base weights from the public `Wan-AI/Wan2.2-TI2V-5B` / `Wan-AI/Wan2.1-I2V-14B-480P` repos on the
+> **first** serve (~16 GB, cached in `~/.cache/huggingface`, reused across checkpoints), then are
+> overwritten by the checkpoint's weights — so the served model is 100 % the checkpoint, but the first
+> launch needs HF access. (To run fully offline, pre-download the full backbone and repoint the four
+> `*_pretrained_path` entries — see `LIBERO_FINAL_INSTRUCTION.md` §3.) The action-loss-only /
+> skip-noisy-video flags are read from the config (they only change how the action head attends — no
+> extra weights), so the checkpoint serves with the right variant automatically.
 
 ---
 
 ## 3. Run the standalone soft eval (single GPU)
 
 Two shells on the same box (use `tmux`): **Terminal A = policy server (`dreamzero`, GPU)**,
-**Terminal B = sim client (`dreamzero_libero`, CPU rendering)**.
+**Terminal B = sim client (`dreamzero_libero`, EGL GPU rendering by default)**.
 
 ### Terminal A — policy server (GPU 0)
 ```bash
@@ -167,8 +208,10 @@ conda activate dreamzero && cd "$DZ" && set -a; . ./.env; set +a
 export CKPT_STEP=${CKPT_STEP:?set this to the step you downloaded, e.g. 36000}
 export CKPT=$PWD/checkpoints/dreamzero_libero_al_only_eval/checkpoint-$CKPT_STEP
 
-# EAGER path (works on every GPU arch, incl. Blackwell). On Hopper/A100 you MAY drop the two
-# TORCHDYNAMO/TORCH_COMPILE vars for a faster (compiled) server.
+# EAGER server — the DEFAULT here: works on every GPU arch (incl. Blackwell) and avoids torch.compile
+# surprises. First launch downloads the encoder base weights from HF (~16 GB, cached), so it can take a
+# few minutes. (Optional: on Hopper/A100 drop the two TORCHDYNAMO/TORCH_COMPILE vars for a compiled
+# server, but rendering+sim usually dominate, so the speedup is modest.)
 TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1 CUDA_VISIBLE_DEVICES=0 \
 python eval_utils/serve_dreamzero_libero.py \
     --model_path "$CKPT" --embodiment_tag libero_sim \
@@ -180,9 +223,11 @@ Wait for `server listening on 0.0.0.0:8000` before starting Terminal B.
 ```bash
 conda activate dreamzero_libero && cd "$DZ"
 export OUT=./eval_outputs/soft
+# EGL = GPU rendering, the DEFAULT (much faster than OSMesa). If EGL ever SIGABRTs on your box, swap to
+# the CPU fallback: MUJOCO_GL=osmesa (and drop MUJOCO_EGL_DEVICE_ID). Use 3 trials to run ~40% faster.
 for SUITE in libero_spatial libero_object libero_goal libero_10; do
   echo "==== $SUITE ===="
-  MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py \
+  MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 python eval_utils/run_libero_eval.py \
       --host 0.0.0.0 --port 8000 \
       --task-suite-name "$SUITE" \
       --num-trials-per-task 5 \
@@ -197,18 +242,18 @@ done
   (`libero_spatial` 220, `libero_object` 280, `libero_goal` 300, `libero_10` 520).
 - Metrics are written **incrementally** (a crash mid-run still leaves partial results).
 
-**Smoke test first** (recommended, ~2 min) before the multi-hour full run:
+**Smoke test first** (recommended, ~1–2 min) before the multi-hour full run:
 ```bash
-MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py --host 0.0.0.0 --port 8000 \
+MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 python eval_utils/run_libero_eval.py --host 0.0.0.0 --port 8000 \
     --task-suite-name libero_goal --max-tasks 1 --num-trials-per-task 2 --max-steps-override 120 \
     --video-out-path ./eval_outputs/smoke/videos --metrics-out-path ./eval_outputs/smoke/metrics.json
 ```
 
-> **Runtime:** ~1–3 min/episode (OSMesa CPU rendering; `libero_10` is longer at 520 steps). The full
-> 4 suites × 10 tasks × 5 trials = **200 episodes** ≈ a few hours. To speed up: use the **compiled**
-> server on Hopper/A100 (drop the dynamo vars), and/or GPU rendering with `MUJOCO_GL=egl
-> MUJOCO_EGL_DEVICE_ID=0` (faster, but on a single shared GPU EGL can occasionally SIGABRT — OSMesa is
-> the robust default).
+> **Runtime:** with **EGL** GPU rendering, policy inference (~1.5 s/call, every 5 sim steps) dominates;
+> figure ~0.5–1.5 min/episode (`libero_10` longer at 520 steps). The full 4 suites × 10 tasks × 5 trials
+> = **200 episodes** ≈ 2–4 h (drop to **3 trials** to cut that ~40 %). If EGL SIGABRTs on a busy/shared
+> GPU, fall back to `MUJOCO_GL=osmesa` (CPU, robust but ~2–3× slower). A compiled server (Hopper/A100,
+> drop the dynamo vars) helps only modestly since rendering+sim, not inference, is the floor.
 
 ---
 
@@ -262,22 +307,33 @@ To get a single number across all 4 suites, average each suite's `overall_succes
 
 ## 5. Notes / gotchas
 
-1. **Eval is self-contained from the checkpoint** — only the checkpoint dir (model-only is fine) and the
-   **umt5 tokenizer** are required. No training dataset, no separate Wan2.2/Wan2.1 backbone.
-2. **The variant is baked into the checkpoint.** `action_loss_only` and `action_skip_noisy_video` are
-   stored in `checkpoint-*/config.json` and applied automatically at serve time, so the eval commands
-   here are identical to any other LIBERO checkpoint — no extra flags needed.
-3. **`--tokenizer_path` is mandatory on a fresh box.** The checkpoint's baked `tokenizer_path` is an
-   absolute path from the training machine; pass `./checkpoints/umt5-xxl` to override it.
-4. **Compile toggle:** eager (`TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1`) is universal; on
-   Hopper/A100 you can drop both for a faster compiled server. On Blackwell keep eager (bundled
-   `ptxas` can't target `sm_103a`).
-5. **Rendering backend:** `MUJOCO_GL=osmesa` (CPU) is the robust single-GPU default; `MUJOCO_GL=egl`
-   (set `MUJOCO_EGL_DEVICE_ID=0`) is faster but can clash with the server on the same GPU.
-6. **Progress thresholds** (`--approach-dist`, `--place-dist`) are heuristics for the *intermediate*
+1. **Where weights come from.** The checkpoint safetensors hold *all* final weights. The DiT loads
+   straight from the checkpoint (`skip_component_loading=true`, §2 step d). The T5/VAE/CLIP encoder
+   *wrappers* fetch base weights from public HF (`Wan-AI/Wan2.2-TI2V-5B`, `Wan-AI/Wan2.1-I2V-14B-480P`)
+   on the **first** serve (~16 GB, cached, reused), then are overwritten by the checkpoint — so the
+   first launch needs HF access but the served model is 100 % the checkpoint. No training dataset.
+2. **The variant is baked into the checkpoint.** `action_loss_only` and `action_skip_noisy_video` live in
+   `checkpoint-*/config.json` (`action_skip_noisy_video` under `action_head_cfg.config.diffusion_model_cfg`)
+   and are reconstructed at serve time, so the serve command is identical to any LIBERO checkpoint — no
+   extra flags. Sanity-check the inference path offline (no GPU):
+   `CUDA_VISIBLE_DEVICES="" ATTENTION_BACKEND=torch python scripts/test_action_skip_noisy_video.py`.
+3. **No CUDA toolkit needed.** Use the **prebuilt flash-attn wheel** (§1a) and **uninstall deepspeed**
+   (`transformers` imports it at serve time and its importer calls `nvcc`, crashing on a box without
+   `/usr/local/cuda`). Both are done in §1a; eval needs neither `nvcc` nor DeepSpeed.
+4. **Don't shadow the DiT path.** The checkpoint's baked `diffusion_model_pretrained_path` is literally
+   `…/checkpoints/Wan2.2-TI2V-5B`; if that dir exists but lacks `diffusion_pytorch_model.safetensors`
+   (e.g. a tokenizer-only download), serve crashes. §2 keeps the tokenizer out of that path **and** sets
+   `skip_component_loading=true`, which sidesteps the DiT load entirely.
+5. **`--tokenizer_path` is mandatory on a fresh box.** The checkpoint's baked `tokenizer_path` is an
+   absolute training-machine path; pass `./checkpoints/umt5-xxl`.
+6. **Server = eager (default).** `TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1` is universal. On
+   Hopper/A100 you *may* drop both for a compiled server (modest gain; rendering/sim is the floor). On
+   Blackwell keep eager (bundled `ptxas` can't target `sm_103a`).
+7. **Rendering = EGL (default).** `MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0` is the fast GPU default; if it
+   SIGABRTs on a busy/shared GPU, fall back to `MUJOCO_GL=osmesa` (CPU, robust, ~2–3× slower).
+8. **Progress thresholds** (`--approach-dist`, `--place-dist`) are heuristics for the *intermediate*
    stages; `grasp_src` (fingerpad contact) and `done` (exact BDDL predicate) need no tuning. Because of
    soft-credit, `progress == 1.0` always coincides with binary success regardless of thresholds.
-7. **Disk:** model-only checkpoint ≈ 30 GB; tokenizer a few MB; rollout MP4s a few hundred MB. Videos
-   are saved by default — add **`--no-save-videos`** to the client command if you only want
-   `metrics.json`.
-8. **`.env` is git-ignored — never commit it.**
+9. **Disk:** model-only checkpoint ≈ 24 GB; HF encoder cache ≈ 16 GB (one-time); tokenizer a few MB;
+   rollout MP4s a few hundred MB. Add **`--no-save-videos`** if you only want `metrics.json`.
+10. **`.env` is git-ignored — never commit it.**

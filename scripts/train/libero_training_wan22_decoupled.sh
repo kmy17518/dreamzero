@@ -10,7 +10,7 @@
 # video without dropping either loss ("action loss / dynamics loss decoupled").
 #
 # The ONLY difference vs. scripts/train/libero_training_wan22.sh is the action_head config
-# (selects wan_flow_matching_action_tf_wan22_decoupled, which sets
+# (selects decoupled_action_loss_dynamics_loss, which sets
 # diffusion_model_cfg.decouple_action_dynamics=true) and a separate default OUTPUT_DIR so the two
 # runs never collide. The original joint-loss path and the action-loss-only path are unaffected
 # (the new behavior is gated behind a config flag that defaults to off).
@@ -104,7 +104,7 @@ cd "$DREAMZERO_ROOT"
     action_horizon=24 \
     num_views=2 \
     model=dreamzero/vla \
-    model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_decoupled \
+    model/dreamzero/action_head=decoupled_action_loss_dynamics_loss \
     model/dreamzero/transform=dreamzero_cotrain \
     num_frame_per_block=2 \
     num_action_per_block=24 \

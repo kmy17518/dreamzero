@@ -16,7 +16,7 @@
 # output while keeping the clean video history (+ CLIP cross-attention + proprio state) as context.
 # CLIP image features are injected via cross-attention and are unaffected by this flag.
 #
-# Select with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_action_loss_only_skip_noisy_video
+# Select with: model/dreamzero/action_head=action_loss_only
 
 defaults:
   - wan_flow_matching_action_tf_wan22_action_loss_only

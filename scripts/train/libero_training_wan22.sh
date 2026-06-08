@@ -80,7 +80,7 @@ cd "$DREAMZERO_ROOT"
     action_horizon=24 \
     num_views=2 \
     model=dreamzero/vla \
-    model/dreamzero/action_head=wan_flow_matching_action_tf_wan22 \
+    model/dreamzero/action_head=joint_action_loss_dynamics_loss \
     model/dreamzero/transform=dreamzero_cotrain \
     num_frame_per_block=2 \
     num_action_per_block=24 \

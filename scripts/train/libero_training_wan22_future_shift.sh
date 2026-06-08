@@ -9,7 +9,7 @@
 #   i.e. the video timestep is shifted into the future relative to the action ("at t: action for
 #   t+1, video for t+2, conditioned on the current obs + the previously-generated t+1 frame").
 #   This is enabled purely by the action-head config override below
-#   (model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_future_shift), which sets
+#   (model/dreamzero/action_head=use_generated_video_feedback), which sets
 #   future_frame_shift=true. The data pipeline, resolution, and block sizes are UNCHANGED, so the
 #   original training path (libero_training_wan22.sh) is completely unaffected.
 #
@@ -87,7 +87,7 @@ cd "$DREAMZERO_ROOT"
     action_horizon=24 \
     num_views=2 \
     model=dreamzero/vla \
-    model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_future_shift \
+    model/dreamzero/action_head=use_generated_video_feedback \
     model/dreamzero/transform=dreamzero_cotrain \
     num_frame_per_block=2 \
     num_action_per_block=24 \

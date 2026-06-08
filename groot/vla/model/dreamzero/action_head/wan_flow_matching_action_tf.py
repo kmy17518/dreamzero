@@ -158,7 +158,7 @@ class WANPolicyHeadConfig(PretrainedConfig):
     # (video o_b, action a_{b-1}, state s_{b-1}) instead of the aligned (o_b, a_b, s_b). The video
     # diffusion pipeline is untouched; only the action/state register is rolled back
     # `future_frame_shift_blocks` block(s) and the now-unsupervised leading block(s) are masked
-    # out of the action loss. See docs/LIBERO_EXPLICIT_CONDITIONING.md.
+    # out of the action loss. See docs/GENERATED_VIDEO_FEEDBACK.md.
     future_frame_shift: bool = field(
         default=False,
         metadata={"help": "Predict video one block ahead of the action/state (explicit conditioning)."},

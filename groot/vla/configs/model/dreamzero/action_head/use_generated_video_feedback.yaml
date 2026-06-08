@@ -1,7 +1,7 @@
 # @package _global_
 # Wan2.2-TI2V-5B action head + explicit-conditioning "future-frame shift" for LIBERO.
 #
-# Identical to wan_flow_matching_action_tf_wan22 except it turns on future_frame_shift, so the
+# Identical to joint_action_loss_dynamics_loss except it turns on future_frame_shift, so the
 # joint DiT predicts the video block ONE step ahead of the action/state it co-produces:
 #     register slot b  ->  video o_b ,  action a_{b-1} ,  state s_{b-1}
 # (vs. the aligned o_b/a_b/s_b in the default head). The video diffusion target/pipeline is
@@ -9,7 +9,7 @@
 # block (a_{-1}) is masked out of the action loss. At eval the policy server primes one query so the
 # emitted actions stay correctly aligned with the robot (see eval_utils/serve_dreamzero_libero.py).
 defaults:
-  - wan_flow_matching_action_tf_wan22
+  - joint_action_loss_dynamics_loss
 
 action_head_cfg:
   config:

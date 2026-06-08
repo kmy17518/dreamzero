@@ -335,9 +335,16 @@ To get a single number across all 4 suites, average each suite's `overall_succes
 8. **Progress thresholds** (`--approach-dist`, `--place-dist`) are heuristics for the *intermediate*
    stages; `grasp_src` (fingerpad contact) and `done` (exact BDDL predicate) need no tuning. Because of
    soft-credit, `progress == 1.0` always coincides with binary success regardless of thresholds.
-9. **Verify shard completeness.** Some steps on the mirror can be incomplete (e.g. `checkpoint-15000`
-   was missing safetensors shards 1–2 and won't load). Confirm the local checkpoint has all
-   `model-0000N-of-0000M.safetensors` referenced by `model.safetensors.index.json` before serving.
+9. **Verify shard completeness — and recovering a missing *frozen* shard.** Some steps on the mirror can
+   be incomplete (e.g. `checkpoint-15000` was missing `model-00001/00002-of-00006` and won't load).
+   Confirm the local checkpoint has every `model-0000N-of-0000M.safetensors` referenced by
+   `model.safetensors.index.json` before serving. **If the missing shard holds only frozen weights it is
+   recoverable without a re-upload:** here shards 1–2 are entirely `action_head.text_encoder` (the frozen
+   umt5-xxl T5 encoder) and are **byte-identical across all checkpoints** (`sha256` of `model-00001/2` match
+   between any two complete steps; only the trained DiT shards differ). So fill them by copying that shard
+   from any complete checkpoint, e.g. `cp checkpoint-36000/model-0000{1,2}-of-00006.safetensors
+   checkpoint-15000/`. (Trained shards — DiT/projector/action-head — are step-specific and **cannot** be
+   reconstructed this way.) The shard→tensor map is identical across steps, so the index still matches.
 10. **Disk:** model-only checkpoint ≈ 30 GB; Wan backbone ≈ 28 GB; tokenizer a few MB; rollout MP4s a
     few hundred MB. Videos are saved by default — add **`--no-save-videos`** if you only want `metrics.json`.
 11. **`.env` is git-ignored — never commit it.**

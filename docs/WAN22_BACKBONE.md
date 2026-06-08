@@ -124,9 +124,9 @@ bash scripts/train/droid_training_wan22.sh
 
 ## Configuration Details
 
-The Wan2.2 config (`wan_flow_matching_action_tf_wan22.yaml`) overrides:
+The Wan2.2 config (`joint_action_loss_dynamics_loss.yaml`) overrides:
 
-- **model/dreamzero/action_head**: `wan_flow_matching_action_tf_wan22`
+- **model/dreamzero/action_head**: `joint_action_loss_dynamics_loss`
 - **diffusion_model_cfg**: Wan2.2 architecture (dim=3072, in_dim=48, out_dim=48, etc.)
 - **vae_cfg**: `WanVideoVAE38` (48-channel Wan2.2 VAE)
 - **frame_seqlen**: 50 (patch output per frame)
@@ -142,7 +142,7 @@ For other resolutions, `frame_seqlen` must match patch output per frame; use H a
 To use Wan2.2 in your own training script, add:
 
 ```bash
-model/dreamzero/action_head=wan_flow_matching_action_tf_wan22 \
+model/dreamzero/action_head=joint_action_loss_dynamics_loss \
 dit_version=$WAN22_CKPT_DIR \
 text_encoder_pretrained_path=$WAN22_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth \
 image_encoder_pretrained_path=$IMAGE_ENCODER_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
@@ -156,7 +156,7 @@ vae_pretrained_path=$WAN22_CKPT_DIR/Wan2.2_VAE.pth
 dreamzero/
 ├── groot/vla/configs/model/dreamzero/action_head/
 │   ├── wan_flow_matching_action_tf.yaml      # Wan2.1 (default)
-│   └── wan_flow_matching_action_tf_wan22.yaml  # Wan2.2-TI2V-5B
+│   └── joint_action_loss_dynamics_loss.yaml  # Wan2.2-TI2V-5B
 ├── scripts/train/
 │   ├── droid_training.sh           # Wan2.1 backbone
 │   └── droid_training_wan22.sh     # Wan2.2 backbone

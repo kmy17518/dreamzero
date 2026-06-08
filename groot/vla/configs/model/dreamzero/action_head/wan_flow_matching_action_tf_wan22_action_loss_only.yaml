@@ -1,0 +1,13 @@
+# @package _global_
+# Action-loss-only variant of the Wan2.2-TI2V-5B action head.
+# Identical to joint_action_loss_dynamics_loss EXCEPT the optimized training loss is ONLY the
+# action flow-matching loss (train/action_loss). The video dynamics loss (train/dynamics_loss) is
+# still computed and logged for monitoring, but contributes no gradient.
+# Select with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_action_loss_only
+
+defaults:
+  - joint_action_loss_dynamics_loss
+
+action_head_cfg:
+  config:
+    action_loss_only: true

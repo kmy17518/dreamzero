@@ -7,7 +7,7 @@ and warms the cache; subsequent requests use FRAMES_PER_CHUNK=4 frames and appen
 On session_id change (or explicit reset), buffers and action_head.current_start_frame are cleared.
 
 The checkpoint at model_path should be DreamZero with Wan22 5B (model/dreamzero/action_head=
-wan_flow_matching_action_tf_wan22, data droid_relative_wan22 → 160×320). GrootSimPolicy loads
+joint_action_loss_dynamics_loss, data droid_relative_wan22 → 160×320). GrootSimPolicy loads
 that checkpoint and runs inference; it is the correct policy class for DreamZero.
 
 Usage (single GPU):

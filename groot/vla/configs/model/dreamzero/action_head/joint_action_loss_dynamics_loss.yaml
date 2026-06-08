@@ -1,7 +1,10 @@
 # @package _global_
-# Wan2.2-TI2V-5B backbone config for DreamZero DROID training
-# Uses CausalWanModel with Wan2.2 architecture (dim=3072, 48-channel VAE)
-# Override base config with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan22
+# Joint (dynamics + action) baseline action head on the Wan2.2-TI2V-5B backbone.
+# The joint DiT is trained on BOTH the video/dynamics flow-matching loss AND the action
+# flow-matching loss; action tokens attend to the noisy (being-generated) video.
+# Uses CausalWanModel with Wan2.2 architecture (dim=3072, 48-channel VAE).
+# Select with: model/dreamzero/action_head=joint_action_loss_dynamics_loss
+# (Also used as the backbone action head for DROID training.)
 
 defaults:
   - wan_flow_matching_action_tf

@@ -1,274 +1,327 @@
-# NVIDIA DreamZero: World Action Models Are Zero-Shot Policies
-A research project from [NVIDIA GEAR Lab](https://research.nvidia.com/labs/gear/).
+# CS224R Project: Do generated futures help robot policies through representation alignment or explicit conditioning?
 
-[![NVIDIA](https://img.shields.io/badge/NVIDIA-76B900?style=flat&logo=nvidia&logoColor=white)](https://www.nvidia.com) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE) [![arXiv](https://img.shields.io/badge/arXiv-2602.15922-b31b1b.svg)](https://arxiv.org/abs/2602.15922)
 
-[[Project Page](https://dreamzero0.github.io/)] [[Paper](https://arxiv.org/abs/2602.15922)]
+**Motivation.** Many recent robot-learning systems predict a generated future — a future image, video, or
+language sub-goal — and report performance gains, yet it is unclear *why* these futures help. This repo
+isolates two mechanisms that are usually entangled: **representation alignment** (predicting the future
+during training shapes a better internal representation) and **explicit conditioning** (the generated
+future is fed into the action path as additional input).
 
-DreamZero is a World Action Model that jointly predicts actions and videos, achieving strong zero-shot performance on unseen tasks. This release package contains everything needed to load a pretrained DreamZero model and run distributed inference via a WebSocket server.
+These experiments are **WAM (World-Action Model) variants** — built on the **Wan2.2-TI2V-5B** video
+backbone, with **DreamZero** used as reference — full-fine-tuned and evaluated on the
+[LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) benchmark in the LIBERO MuJoCo simulator. A
+WAM jointly predicts actions and video; each experiment below toggles how (and whether) the generated
+future participates in training and eval.
 
-## News
 
-- **02/27:** DreamZero is **#1 on both [MolmoSpaces]([https://huggingface.co/spaces/ai2-adapt/MolmoSpaces](https://molmospaces.allen.ai/leaderboard)) and [RoboArena]([https://robo-arena.github.io/](https://robo-arena.github.io/leaderboard))**! DreamZero-DROID is trained *from scratch* using only the DROID dataset — no pretraining on large-scale robot data, unlike competing VLAs. This demonstrates the strength of video-model backbones for generalist robot policies (VAMs/WAMs).
-- **02/27:** Released **DreamZero-AgiBot checkpoint** and **post-training code** for efficient few-shot adaptation. Post-train on just ~30 minutes of play data for your specific robot, and see the robot do basic language following and pick-and-place (see YAM experiments in our paper for more detail).
-- **02/20:** Released the **full training codebase, preprocessed dataset, and guide for new embodiments** to replicate the DreamZero-DROID checkpoint and train on your own robot. See [Adding a New Embodiment to DreamZero](docs/DATASET_TO_GEAR_AND_TRAIN.md) for a step-by-step walkthrough.
+---
 
-## Features
+## The four train/eval options
 
-**Available Now**
-- Pretrained DreamZero-DROID model checkpoint [[Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-DROID)]
-- Pretrained DreamZero-AgiBot checkpoint (for post-training on new embodiments) [[Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot)]
-- Distributed WebSocket inference server (GB200, H100)
-- DiT caching for optimized inference (~0.6s on GB200, ~3s on H100)
-- DROID simulation evaluation support
-- [RoboArena](https://robo-arena.github.io/) integration (DROID real)
-- Video generation and saving (MP4)
-- LoRA and full fine-tuning training scripts
-- Training on new embodiments (AgiBot, YAM) — see [guide](docs/DATASET_TO_GEAR_AND_TRAIN.md)
+Each option is just a Hydra **action-head config**: the option name *is* the value you pass as
+`model/dreamzero/action_head=<option>`, and the matching launcher sets it for you. All options share the
+same dataset, backbone weights, two-environment eval harness, and checkpoint/eval watcher — they differ
+only in this action-head config.
 
-**Coming Soon**
-- [PolaRiS](https://polaris-evals.github.io/) simulation environment support
-- [Genie 3.0](https://arxiv.org/abs/2601.02078) sim environment support for DreamZero-AgiBot
-
-## Testing Out DreamZero in Simulation with API
-We provide an inference script that directly evaluates a hosted DreamZero-DROID policy on [`sim_evals`](https://github.com/arhanjain/sim-evals). To test out the policy, first request access to the API via this form [link](https://forms.gle/zCj5zjDvHsoeuMXU7). Then, follow these instructions to install [`sim_evals`](https://github.com/arhanjain/sim-evals) and launch evaluation.
-
-```bash
-# Clone repository
-git clone --recurse-submodules https://github.com/arhanjain/sim-evals.git
-cd sim-evals
-
-# Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Activate uv environment
-uv sync
-source .venv/bin/activate
-
-# [Optional] update pytorch versions
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu129
-
-# Download assets (may need to export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN> first)
-uvx hf download owhan/DROID-sim-environments --repo-type dataset --local-dir assets
-
-# Run eval script
-cd ..
-python eval_utils/run_sim_eval.py --host <API_HOST> --port <API_PORT> 
-```
-
-The outputs are saved in `runs` directory.
-
-
-## Quick Start
-
-### Prerequisites
-
-- **Python**: 3.11
-- **Hardware**: Multi-GPU setup (tested on GB200, H100)
-  - Minimum: 2 GPUs for distributed inference
-- **CUDA**: Compatible GPU with CUDA 12.9+
-
-### Installation
-
-1. **Create conda environment:**
-```bash
-conda create -n dreamzero python=3.11
-conda activate dreamzero
-```
-
-2. **Install dependencies (PyTorch 2.8+ with CUDA 12.9+):**
-```bash
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129
-```
-
-3. **Install flash attention:**
-```bash
-MAX_JOBS=8 pip install --no-build-isolation flash-attn
-```
-
-4. **[GB200 ONLY, SKIP FOR H100] Install Transformer Engine:**
-```bash
-pip install --no-build-isolation transformer_engine[pytorch]
-```
-
-5. **[GB200 ONLY FOR TENSORRT, SKIP FOR H100] Install Tensorrt:**
-```bash
-pip install tensorrt==10.13.2.6 tensorrt_cu13==10.13.2.6 tensorrt_cu13_libs==10.13.2.6 tensorrt_cu13_bindings==10.13.2.6 --no-deps
-pip install transformer_engine==2.10.0 transformer_engine_cu12==2.10.0 transformer_engine_torch==2.10.0
-```
-
-## Downloading Pretrained Checkpoints
-
-### DreamZero-DROID (for inference)
-
-We release a 14B pretrained DROID checkpoint on [Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-DROID). To download the checkpoint, run
-
-```bash
-hf download GEAR-Dreams/DreamZero-DROID --repo-type model --local-dir <path/to/checkpoint>
-```
-
-### DreamZero-AgiBot (for fine-tuning on new embodiments)
-
-To fine-tune DreamZero on a new embodiment (e.g. YAM, AgiBot), download the pretrained [DreamZero-AgiBot](https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot) checkpoint (~45GB) to `./checkpoints/DreamZero-AgiBot`:
-
-```bash
-git clone https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot ./checkpoints/DreamZero-AgiBot
-```
-
-Or with the Hugging Face CLI:
-
-```bash
-hf download GEAR-Dreams/DreamZero-AgiBot --repo-type model --local-dir ./checkpoints/DreamZero-AgiBot
-```
-
-The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/DreamZero-AgiBot` by default. See the [new embodiment guide](docs/DATASET_TO_GEAR_AND_TRAIN.md) for usage.
-
-## Running the Inference Server
-
-### Command Overview
-
-The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint>
-```
-
-(Optional only for GB200) Tensorrt enables faster generation
-```bash
-export LOAD_TRT_ENGINE=<path/to/checkpoint>/tensorrt/wan/WanModel_nvfp4.trt 
-export DYNAMIC_CACHE_SCHEDULE=true 
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 /mnt/aws-lfs-02/shared/seonghyeony/dreamzero/socket_test_optimized_AR.py --port 8000 --enable-dit-cache --model-path <path/to/checkpoint>
-```
-To verify the server is working, run a test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.6s on GB200 and ~3s on H100.
-
-```
-python test_client_AR.py --port 5000
-```
-
-### Command-line Arguments
-
-- `--port`: Port number for the WebSocket server (default: 8000)
-- `--model-path`: Path to the pretrained model checkpoint directory
-- `--enable-dit-cache`: Enable caching in DiT layers for faster inference (recommended)
-- `--max-chunk-size`: Override max_chunk_size for inference (optional)
-- `--timeout-seconds`: Server timeout in seconds (default: 50000)
-- `--index`: Index for output directory naming (default: 0)
-
-
-### Output
-
-The server saves:
-- **Videos**: Generated video predictions as MP4 files in `{model_path}/real_world_eval_gen_{date}_{index}/{checkpoint_name}/`
-- **Input observations**: Saved per message in `{output_dir}/inputs/{msg_index}_{timestamp}/`
-
-
-## Training
-
-> **Training on a new embodiment?** See [Adding a New Embodiment to DreamZero](docs/DATASET_TO_GEAR_AND_TRAIN.md) for a complete guide on converting your dataset, configuring modalities, and launching training. <em>Make sure to align the 3 camera view order to ensure positive transfer.</em>
-
-### Downloading Pretrained Base Model Weights
-
-DreamZero is built on top of [Wan2.1-I2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P) and uses the [umt5-xxl](https://huggingface.co/google/umt5-xxl) tokenizer. Download both before training:
-
-```bash
-pip install "huggingface_hub[cli]"
-
-# You may need to set your HuggingFace token:
-# export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN>
-
-# Download Wan2.1 model weights (~28GB)
-hf download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./checkpoints/Wan2.1-I2V-14B-480P
-
-# Download umt5-xxl tokenizer
-hf download google/umt5-xxl --local-dir ./checkpoints/umt5-xxl
-```
-
-> **Note:** The training script will auto-download these if they are not found at the configured paths, but pre-downloading is recommended to avoid delays at launch.
-
-### DROID Dataset
-
-We release the preprocessed DROID dataset used to train DreamZero on HuggingFace: [GEAR-Dreams/DreamZero-DROID-Data](https://huggingface.co/datasets/GEAR-Dreams/DreamZero-DROID-Data).
-
-This dataset is derived from the [DROID 1.0.1](https://droid-dataset.github.io/) dataset with the following modifications:
-- Converted from RLDS/TFDS format to [LeRobot](https://github.com/huggingface/lerobot) v2.0 format
-- Idle frames removed using [Physical Intelligence's idle frame detector](https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/README_train.md#data-filtering) (`droid_sample_ranges_v1_0_1.json`)
-- Episodes without language annotations are filtered out
-- Successful episodes only (episodes with non-zero reward)
-- 3 camera views: `exterior_image_1_left`, `exterior_image_2_left`, `wrist_image_left`
-
-**To download the preprocessed dataset (~131GB):**
-
-```bash
-huggingface-cli download GEAR-Dreams/DreamZero-DROID-Data --repo-type dataset --local-dir ./data/droid_lerobot
-```
-
-If you want to reproduce the dataset conversion from raw DROID 1.0.1 yourself (or modify the filtering), see [docs/DROID_CONVERSION.md](docs/DROID_CONVERSION.md).
-
-### Running Training
-
-```bash
-# Configure paths (override defaults as needed)
-export DROID_DATA_ROOT="./data/droid_lerobot"
-export OUTPUT_DIR="./checkpoints/dreamzero_droid"
-export NUM_GPUS=4
-
-# Point to your downloaded model weights (if not using default paths)
-export WAN_CKPT_DIR="./checkpoints/Wan2.1-I2V-14B-480P"
-export TOKENIZER_DIR="./checkpoints/umt5-xxl"
-
-# Launch training
-bash scripts/train/droid_training.sh
-```
-
-**Using Wan2.2-TI2V-5B backbone (5B params, lower VRAM):** To train with the smaller Wan2.2-TI2V-5B model instead of Wan2.1-I2V-14B, see [docs/WAN22_BACKBONE.md](docs/WAN22_BACKBONE.md) and run `bash scripts/train/droid_training_wan22.sh`.
-
-### Training Configuration
-
-The training script uses Hydra for configuration and DeepSpeed ZeRO Stage 2 for distributed training. Key defaults:
-
-| Parameter | Default | Description |
+| Option | Action-head config | Train launcher |
 |---|---|---|
-| `NUM_GPUS` | 4 | Number of GPUs |
-| `per_device_train_batch_size` | 1 | Batch size per GPU |
-| `learning_rate` | 1e-5 | Learning rate |
-| `max_steps` | 10 | Max training steps (increase for full training) |
-| `warmup_ratio` | 0.05 | Warmup ratio |
-| `weight_decay` | 1e-5 | Weight decay |
-| `image_resolution_width` | 320 | Image width |
-| `image_resolution_height` | 176 | Image height |
-| `num_frames` | 33 | Number of video frames |
-| `action_horizon` | 24 | Action prediction horizon |
-| `save_lora_only` | true | Only save LoRA weights |
-| `bf16` | true | Use bfloat16 precision |
+| `action_loss_only` **(baseline)** | `action_loss_only` | `scripts/train/libero_training_wan22_action_loss_only_skip_noisy_video.sh` |
+| `joint_action_loss_dynamics_loss` | `joint_action_loss_dynamics_loss` | `scripts/train/libero_training_wan22.sh` |
+| `decoupled_action_loss_dynamics_loss` | `decoupled_action_loss_dynamics_loss` | `scripts/train/libero_training_wan22_decoupled.sh` |
+| `use_generated_video_feedback` | `use_generated_video_feedback` | `scripts/train/libero_training_wan22_future_shift.sh` |
 
-> **Note:** `max_steps=10` is set for a quick sanity check. For full training, increase this to your desired number of steps and configure `save_steps` / `save_strategy` accordingly.
+Mapped onto the two mechanisms: `action_loss_only` is the **baseline** — a pure action policy with no
+future prediction; `decoupled_action_loss_dynamics_loss` adds the future/dynamics-prediction loss (with
+the action→generated-video attention cut) to probe **representation alignment**; `joint_action_loss_dynamics_loss`
+adds **explicit conditioning** on the latent video tokens (the action attends to the being-generated
+latent video); and `use_generated_video_feedback` adds **explicit conditioning** on the generated video
+frames (the model's own generated future is fed back into the action path).
 
+See [`docs/`](docs/) for more information on:
+[`GENERATED_VIDEO_FEEDBACK.md`](docs/GENERATED_VIDEO_FEEDBACK.md) (explicit conditioning) and
+[`LIBERO_SOFT_EVAL.md`](docs/LIBERO_SOFT_EVAL.md) (progress-score eval).
 
-## Citation
+---
 
-If you use DreamZero in your research, please cite:
+## 1. Environment setup
 
-```bibtex
-@misc{ye2026worldactionmodelszeroshot,
-      title={World Action Models are Zero-shot Policies}, 
-      author={Seonghyeon Ye and Yunhao Ge and Kaiyuan Zheng and Shenyuan Gao and Sihyun Yu and George Kurian and Suneel Indupuru and You Liang Tan and Chuning Zhu and Jiannan Xiang and Ayaan Malik and Kyungmin Lee and William Liang and Nadun Ranawaka and Jiasheng Gu and Yinzhen Xu and Guanzhi Wang and Fengyuan Hu and Avnish Narayan and Johan Bjorck and Jing Wang and Gwanghyun Kim and Dantong Niu and Ruijie Zheng and Yuqi Xie and Jimmy Wu and Qi Wang and Ryan Julian and Danfei Xu and Yilun Du and Yevgen Chebotar and Scott Reed and Jan Kautz and Yuke Zhu and Linxi "Jim" Fan and Joel Jang},
-      year={2026},
-      eprint={2602.15922},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2602.15922}, 
-}
+The eval is **client–server**, which needs **two conda environments** (LIBERO pins old
+`robosuite`/`mujoco`/`gym` that conflict with the training stack's torch-2.8 / py3.11; they talk over a
+websocket):
+
+- **`train`** — GPU env (py3.11) for **training** and **policy serving**.
+- **`eval`** — CPU env (py3.10) for the **LIBERO MuJoCo sim client**.
+
+A CUDA 12.x toolkit (`nvcc`, e.g. at `/usr/local/cuda`) is required even for eval (the policy server
+imports `deepspeed`, which probes `nvcc` at import).
+
+### 1a. `train` (training + serving, GPU, py3.11)
+
+```bash
+conda create -n train python=3.11 -y
+conda activate train
+export CUDA_HOME=/usr/local/cuda && export PATH=$CUDA_HOME/bin:$PATH
+
+# torch 2.8 (cu129) + this repo (editable)
+pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129
+
+# flash-attn (optional but recommended; SDPA fallback works without it).
+# Prebuilt wheel (fast) — match torch/py/abi; or `MAX_JOBS=32 pip install --no-build-isolation flash-attn` (~15 min compile):
+pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+
+pip install hf_transfer      # fast HF downloads
 ```
 
-## License
+### 1b. `eval` (LIBERO sim client, CPU, py3.10)
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+```bash
+conda create -n eval python=3.10 -y
+conda activate eval
+pip install "setuptools==65.5.0" "wheel==0.38.4" "pip==23.3.2"
+pip install "numpy==1.24.4"
+pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+pip install "robosuite==1.4.1" "mujoco==3.2.3" "bddl==1.0.1" "easydict==1.9" \
+            "opencv-python==4.6.0.66" Pillow "matplotlib==3.5.3"
+pip install "gym==0.25.2" --no-build-isolation
 
-## Support
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git "$HOME/LIBERO"
+pip install -e "$HOME/LIBERO" --no-deps
+pip install websockets msgpack msgpack-numpy openpi-client tqdm tyro imageio imageio-ffmpeg \
+            "hydra-core==1.2.0" termcolor future cloudpickle
 
-For issues and questions:
-- Check the troubleshooting section above
-- Review server logs for detailed error messages
-- Verify your checkpoint is compatible with this release
+# Point LIBERO at its bundled task files
+mkdir -p ~/.libero && cat > ~/.libero/config.yaml <<YAML
+benchmark_root: $HOME/LIBERO/libero/libero
+bddl_files:     $HOME/LIBERO/libero/libero/bddl_files
+init_states:    $HOME/LIBERO/libero/libero/init_files
+datasets:       $HOME/LIBERO/libero/datasets
+assets:         $HOME/LIBERO/libero/libero/assets
+YAML
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=dreamzero0/dreamzero&type=Date)](https://star-history.com/#dreamzero0/dreamzero&Date)
+### 1c. Headless rendering libs + tokens
+
+```bash
+# Eval renders MuJoCo headless. OSMesa (CPU) is the robust default on busy multi-GPU nodes;
+# EGL (GPU) is faster on a dedicated/idle GPU.
+sudo apt-get update -y && sudo apt-get install -y libosmesa6 libgl1-mesa-glx libglfw3 libegl1 libgles2 libglvnd0
+```
+
+Create `./.env` (git-ignored — **never commit it**) with your tokens:
+
+```bash
+cat > .env <<'ENV'
+HF_TOKEN=hf_...        # for downloading weights/dataset (+ checkpoint mirroring if used)
+WANDB_API_KEY=...      # for training/eval logging (optional: WANDB_MODE=disabled to skip)
+ENV
+```
+
+---
+
+## 2. Download backbone weights + dataset
+
+The experiments use the **Wan2.2-TI2V-5B** backbone (DiT + VAE + T5 encoder + umt5 tokenizer) plus the
+**Wan2.1 CLIP** image encoder. These are loaded at model construction (the fine-tuned weights are an
+overlay), so they are required for **both** training and eval.
+
+```bash
+conda activate train && set -a; . ./.env; set +a
+export HF_HUB_ENABLE_HF_TRANSFER=1
+mkdir -p checkpoints data
+
+# (a) Wan2.2-TI2V-5B backbone (~34 GB)
+hf download Wan-AI/Wan2.2-TI2V-5B --local-dir ./checkpoints/Wan2.2-TI2V-5B
+# (b) CLIP image encoder from Wan2.1 (~4.5 GB; Wan2.2 doesn't ship it)
+hf download Wan-AI/Wan2.1-I2V-14B-480P \
+    --include "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+    --local-dir ./checkpoints/Wan2.1-I2V-14B-480P
+# (c) umt5-xxl tokenizer (bundled inside Wan2.2 — copy it out)
+mkdir -p ./checkpoints/umt5-xxl && cp ./checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl/* ./checkpoints/umt5-xxl/
+```
+
+**LIBERO dataset** — download then convert to the MP4 LeRobot format (the openpi LeRobot dataset stores
+frames as PNG bytes inside parquet; this codebase reads on-disk MP4):
+
+```bash
+# (d) ~11 GB after conversion (1693 episodes / 273k frames)
+hf download physical-intelligence/libero --repo-type dataset --local-dir ./data/libero_raw_lerobot
+python scripts/data/convert_libero_to_dreamzero.py \
+    --src data/libero_raw_lerobot --dst data/libero_lerobot --num-workers 64
+```
+
+---
+
+## 3. Training
+
+All launchers read the same env-var knobs and differ only in the action-head config they select.
+Common knobs (with defaults):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `NUM_GPUS` | 8 | data-parallel GPUs (ZeRO-2; **needs ≥ 2**) |
+| `CUDA_VISIBLE_DEVICES` | (all) | which GPUs to use |
+| `OUTPUT_DIR` | per-option default under `checkpoints/` | checkpoint dir (auto-resumes from latest `checkpoint-N`) |
+| `LIBERO_DATA_ROOT` | `data/libero_lerobot` | converted dataset |
+| `PER_DEVICE_BATCH_SIZE` | 1 | **bs=1 only** (grow the global batch via more GPUs / `gradient_accumulation_steps`) |
+| `MAX_STEPS` | 100 | training steps |
+| `SAVE_STEPS` / `SAVE_STRATEGY` | 500 / steps | checkpoint cadence |
+| `TRAIN_ARCH` | full | `full` or `lora` |
+| `PYTHON_BIN` | python | python used by `torch.distributed.run` |
+
+`WAN22_CKPT_DIR`, `IMAGE_ENCODER_DIR`, `TOKENIZER_DIR` point at the §2 downloads (defaults assume
+`./checkpoints/...`). Set a unique `WANDB_RUN_ID` per run (eval logs to a sibling `<id>-eval` run).
+
+Pick the launcher for the option you want (here on GPUs 0–6, leaving GPU 7 for the eval watcher):
+
+```bash
+conda activate train && set -a; . ./.env; set +a
+COMMON="NUM_GPUS=7 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 LIBERO_DATA_ROOT=$PWD/data/libero_lerobot \
+        PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=100000 SAVE_STEPS=1000 SAVE_STRATEGY=steps TRAIN_ARCH=full \
+        PYTHON_BIN=$(which python)"
+
+# Option 1 — action_loss_only (baseline)
+env $COMMON WANDB_RUN_ID=libero_action_loss_only \
+    OUTPUT_DIR=$PWD/checkpoints/action_loss_only \
+    bash scripts/train/libero_training_wan22_action_loss_only_skip_noisy_video.sh
+
+# Option 2 — joint_action_loss_dynamics_loss
+env $COMMON WANDB_RUN_ID=libero_joint \
+    OUTPUT_DIR=$PWD/checkpoints/joint_action_loss_dynamics_loss \
+    bash scripts/train/libero_training_wan22.sh
+
+# Option 3 — decoupled_action_loss_dynamics_loss
+env $COMMON WANDB_RUN_ID=libero_decoupled \
+    OUTPUT_DIR=$PWD/checkpoints/decoupled_action_loss_dynamics_loss \
+    bash scripts/train/libero_training_wan22_decoupled.sh
+
+# Option 4 — use_generated_video_feedback
+env $COMMON WANDB_RUN_ID=libero_feedback \
+    OUTPUT_DIR=$PWD/checkpoints/use_generated_video_feedback \
+    bash scripts/train/libero_training_wan22_future_shift.sh
+```
+
+> **Resume is automatic** from `OUTPUT_DIR` (no flag): a top-level `config.json` ⇒ "finished" (skips);
+> else it resumes from the highest `checkpoint-N` (loading the DeepSpeed `global_step*` optimizer
+> state — **`NUM_GPUS` must match the saved ZeRO rank count**); else it trains fresh. Use a new
+> `OUTPUT_DIR` to start over.
+
+---
+
+## 4. Evaluation
+
+Eval is **client–server**: a policy **server** (GPU, `train`) serves actions over a websocket; the
+LIBERO **sim client** (CPU, `eval`) drives the simulator, scores success, and writes rollout MP4s + a
+`metrics.json`. There are two ways to run it.
+
+### 4a. Automatic watcher (recommended alongside training)
+
+For every new `checkpoint-N` under `OUTPUT_DIR`, the watcher serves it on `SERVER_GPU`, runs the sim
+eval, logs `eval/success_rate` to the sibling `<run>-eval` wandb run, keeps `latest-N ∪ best-N`
+locally, and (optionally) mirrors best-N + latest (+ milestones) to a private HF repo.
+
+```bash
+# CONDA_SH/CONDA_ENV let the watcher self-activate conda. Point CONDA_ENV at your GPU/serving env
+# (`train`); CONDA_SH defaults to /root/miniconda3.
+OUTPUT_DIR=$PWD/checkpoints/action_loss_only SERVER_GPU=7 TRIALS=3 MAX_TASKS=3 \
+    CONDA_ENV=train CONDA_SH=$(conda info --base)/etc/profile.d/conda.sh \
+    bash scripts/eval/watch_eval_libero.sh --wandb-run-id libero_action_loss_only
+```
+
+Knobs (env): `SERVER_GPU` (7), `TRIALS` (per task), `MAX_TASKS` (3; `0`=all 10), `TASK_SUITE`
+(`libero_spatial`), `KEEP_BEST`/`KEEP_LATEST`, `UPLOAD_REPO` (+`UPLOAD_BEST`, `MILESTONE_INTERVAL`,
+`UPLOAD_MODEL_ONLY=1`), `MUJOCO_GL_BACKEND` (`osmesa`).
+
+**`use_generated_video_feedback` (grounded feedback) is the same watcher with `CONTEXT_MODE=C REPLAN_STEPS=24`**
+— optionally `SAVE_VIDEO_PRED=1` to dump the model's imagined video:
+
+```bash
+OUTPUT_DIR=$PWD/checkpoints/use_generated_video_feedback SERVER_GPU=7 TRIALS=3 MAX_TASKS=3 \
+    CONTEXT_MODE=C REPLAN_STEPS=24 SAVE_VIDEO_PRED=1 \
+    CONDA_ENV=train CONDA_SH=$(conda info --base)/etc/profile.d/conda.sh \
+    bash scripts/eval/watch_eval_libero.sh --wandb-run-id libero_feedback-C
+```
+
+### 4b. Standalone eval (two terminals)
+
+**Terminal A — policy server** (`train`, GPU). Point `--model_path` at a `checkpoint-N/` dir or a
+finished top-level model. On Blackwell (`sm_103a`) prefix `TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1`
+(the bundled `ptxas` can't target it); on Hopper/A100 it's optional.
+
+```bash
+conda activate train && set -a; . ./.env; set +a
+CUDA_VISIBLE_DEVICES=0 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/action_loss_only/checkpoint-20000 \
+    --embodiment_tag libero_sim --tokenizer_path ./checkpoints/umt5-xxl --port 8000
+```
+
+**Terminal B — sim client** (`eval`, CPU render). Suites: `libero_spatial`,
+`libero_object`, `libero_goal`, `libero_10`, `libero_90`.
+
+```bash
+conda activate eval
+MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8000 --task-suite-name libero_spatial \
+    --num-trials-per-task 50 \
+    --video-out-path ./eval_outputs/libero_spatial/videos \
+    --metrics-out-path ./eval_outputs/libero_spatial/metrics.json
+```
+
+**`use_generated_video_feedback` with grounded feedback** — add `--context_mode C` to the server and
+`--replan-steps 24` to the client (`future_frame_shift` is auto-detected from the checkpoint config):
+
+```bash
+# Terminal A (server)
+CUDA_VISIBLE_DEVICES=0 python eval_utils/serve_dreamzero_libero.py \
+    --model_path ./checkpoints/use_generated_video_feedback/checkpoint-20000 \
+    --embodiment_tag libero_sim --tokenizer_path ./checkpoints/umt5-xxl --port 8000 \
+    --context_mode C --save_video_pred --video_output_dir ./video_pred_output
+# Terminal B (client)
+MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py \
+    --host 0.0.0.0 --port 8000 --task-suite-name libero_spatial \
+    --num-trials-per-task 50 --replan-steps 24 \
+    --video-out-path ./eval_outputs/libero_spatial_C/videos
+```
+
+Useful client flags: `--max-tasks 1 --num-trials-per-task 2 --max-steps-override 60` (quick smoke),
+`--progress-scores` (soft/partial-stage scores — see [`docs/LIBERO_SOFT_EVAL.md`](docs/LIBERO_SOFT_EVAL.md)),
+`--no-save-videos`.
+
+---
+
+## 5. Quick smoke test (2 GPUs train, 1 GPU eval)
+
+Validates that a chosen option trains and evals end-to-end on a tiny budget.
+
+```bash
+conda activate train && set -a; . ./.env; set +a
+
+# Train: 2 GPUs, a couple of steps, save once.
+NUM_GPUS=2 CUDA_VISIBLE_DEVICES=0,1 MAX_STEPS=4 SAVE_STEPS=2 SAVE_STRATEGY=steps \
+    PER_DEVICE_BATCH_SIZE=1 TRAIN_ARCH=full PYTHON_BIN=$(which python) REPORT_TO=none \
+    OUTPUT_DIR=$PWD/checkpoints/smoke_joint LIBERO_DATA_ROOT=$PWD/data/libero_lerobot \
+    bash scripts/train/libero_training_wan22.sh
+
+# Eval: 1 GPU server + tiny client run (1 task, 2 trials, short episodes).
+CUDA_VISIBLE_DEVICES=2 python eval_utils/serve_dreamzero_libero.py \
+    --model_path $PWD/checkpoints/smoke_joint/checkpoint-4 \
+    --embodiment_tag libero_sim --tokenizer_path ./checkpoints/umt5-xxl --port 8000 &
+# (in the eval env)
+MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py --host 0.0.0.0 --port 8000 \
+    --task-suite-name libero_spatial --max-tasks 1 --num-trials-per-task 2 --max-steps-override 60 \
+    --video-out-path ./eval_outputs/smoke/videos --metrics-out-path ./eval_outputs/smoke/metrics.json
+```
+
+---
+
+## Notes / gotchas
+
+- **`bs=1` only.** The action-head loss assumes one sample/device; grow the global batch with more
+  GPUs and/or `training_args.gradient_accumulation_steps`.
+- **Resume needs `NUM_GPUS` = saved ZeRO ranks.** A checkpoint saved with 7 ranks must resume with 7.
+- **Eval rendering:** `MUJOCO_GL=osmesa` (CPU) is robust on busy nodes; `MUJOCO_GL=egl` is faster but
+  aborts when its GPU is saturated. The watcher defaults to OSMesa.
+- **Blackwell eval:** run the server eager (`TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1`); the
+  bundled `ptxas` cannot target `sm_103a`. Training runs eager on all archs.
+- **The Wan backbone is required at eval** (the fine-tuned weights are an overlay); only the training
+  *dataset* is unnecessary for eval.
+- **`.env` is git-ignored — never commit it.**

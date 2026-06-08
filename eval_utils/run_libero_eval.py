@@ -67,7 +67,190 @@ class Args:
     metrics_out_path: str = ""  # default: <video_out_path>/../metrics.json
     save_videos: bool = True
 
+    # Progress (partial / stage) scoring. These only affect the partial-credit numbers; the final
+    # "done" stage of every sub-goal is the exact BDDL predicate, so progress==1.0 <=> env success.
+    # Thresholds are heuristics (object body centers have small offsets) -- tune on a few rollouts.
+    progress_scores: bool = True
+    approach_dist: float = 0.07  # m; gripper<->source-object distance for the "approach source" stage
+    place_dist: float = 0.12  # m; source<->target distance for the "approach target" stage
+
     seed: int = 7
+
+
+# Predicate families used to decompose a BDDL goal into ordered stages. The whole benchmark uses
+# only 6 predicates: on/in are "pick-and-place" (4 stages), open/close/turnon/turnoff are
+# "articulation" (2 stages). A goal is a conjunction of sub-goals; episode progress is the mean of
+# the per-sub-goal stage fractions (additive / parallel aggregation).
+_PICKPLACE_PREDS = ("on", "in")
+_ARTICULATION_PREDS = ("open", "close", "turnon", "turnoff")
+
+
+def _is_push_subgoal(pred_args: list, is_push_task: bool) -> bool:
+    """A pick-place predicate is "push-style" (no grasp) when the target is a table floor zone
+    (e.g. ``main_table_stove_front_region``) or the task language starts with "push"."""
+    target = str(pred_args[1]) if len(pred_args) >= 2 else ""
+    return is_push_task or target.startswith("main_table_")
+
+
+class _SubGoal:
+    """One conjunct of the BDDL goal plus its ordered stage list and latched progress."""
+
+    def __init__(self, pred: str, args: list, family: str, stages: list):
+        self.pred = pred
+        self.args = list(args)
+        self.family = family
+        self.stages = list(stages)
+        self.max_reached = 0  # latched highest stage index reached this episode (0..len(stages))
+
+
+class StageEvaluator:
+    """Computes partial / progress scores for a LIBERO episode from ground-truth sim state.
+
+    Purely client/sim-side: reads object & gripper state and LIBERO's own predicate / grasp helpers.
+    The final stage of every sub-goal is the exact BDDL predicate, so reaching all final stages is
+    identical to ``env._check_success()`` (progress == 1.0 <=> binary success).
+
+    Latching is "strict ordering + soft credit": intermediate stages must be reached in order, but a
+    satisfied predicate (the goal) credits all stages at once, and grasp implies "approached".
+
+    Stage templates by sub-goal family:
+      * pickplace (on/in onto an object/container) : approach_src -> grasp_src -> approach_tgt -> done
+      * push (on/in into a table floor zone, or "push ..." task) : approach_src -> near_tgt -> done
+      * articulation (open/close/turnon/turnoff)   : approach -> done
+    """
+
+    def __init__(self, env, approach_dist: float = 0.07, place_dist: float = 0.12, task_description: str = ""):
+        self.inner = env.env  # underlying BDDLBaseDomain (ControlEnv wraps it as .env)
+        self.d_app = approach_dist
+        self.d_tgt = place_dist
+        self.subgoals = []
+        is_push_task = str(task_description).strip().lower().startswith("push")
+        for conj in self.inner.parsed_problem["goal_state"]:
+            pred = conj[0]
+            pred_args = conj[1:]
+            if pred in _PICKPLACE_PREDS and _is_push_subgoal(pred_args, is_push_task):
+                # Push: the object is shoved into a floor zone, never grasped -> drop the grasp stage.
+                stages = ["approach_src", "near_tgt", "done"]
+                family = "push"
+            elif pred in _PICKPLACE_PREDS:
+                stages = ["approach_src", "grasp_src", "approach_tgt", "done"]
+                family = "pickplace"
+            else:  # open / close / turnon / turnoff (or anything unknown -> treat as 2-stage)
+                stages = ["approach", "done"]
+                family = "articulation"
+            self.subgoals.append(_SubGoal(pred, pred_args, family, stages))
+
+    def reset(self) -> None:
+        for sg in self.subgoals:
+            sg.max_reached = 0
+
+    def _pos(self, name: str) -> np.ndarray:
+        # Works for movable objects (body xpos), region sites (site xpos) and fixtures.
+        return np.asarray(self.inner.object_states_dict[name].get_geom_state()["pos"], dtype=np.float64)
+
+    def _grasped(self, name: str) -> bool:
+        try:
+            return bool(
+                self.inner._check_grasp(
+                    gripper=self.inner.robots[0].gripper,
+                    object_geoms=self.inner.objects_dict[name],
+                )
+            )
+        except Exception:  # noqa: BLE001 - object may not be a movable graspable object
+            return False
+
+    def _pred_true(self, sg: "_SubGoal") -> bool:
+        try:
+            return bool(self.inner._eval_predicate([sg.pred] + sg.args))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _instant_stage(self, sg: "_SubGoal", obs: dict) -> int:
+        """Highest stage index (1..K) currently consistent with progress; 0 if none."""
+        if self._pred_true(sg):
+            return len(sg.stages)  # goal satisfied -> soft-credit every stage
+        eef = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
+        if sg.family == "pickplace":
+            src, tgt = sg.args[0], sg.args[1]
+            grasp = self._grasped(src)
+            stage = 0
+            try:
+                if grasp or np.linalg.norm(eef - self._pos(src)) < self.d_app:
+                    stage = 1  # approached source (grasp implies approached)
+            except Exception:  # noqa: BLE001
+                pass
+            if grasp:
+                stage = 2  # grasped source
+            try:
+                # Approaching the target only counts once we are (or have been) holding the source.
+                if (grasp or sg.max_reached >= 2) and np.linalg.norm(
+                    self._pos(src) - self._pos(tgt)
+                ) < self.d_tgt:
+                    stage = 3
+            except Exception:  # noqa: BLE001
+                pass
+            return stage
+        if sg.family == "push":
+            src, tgt = sg.args[0], sg.args[1]
+            stage = 0
+            near_src = False
+            try:
+                near_src = np.linalg.norm(eef - self._pos(src)) < self.d_app
+            except Exception:  # noqa: BLE001
+                pass
+            if near_src:
+                stage = 1  # gripper reached the object to push
+            try:
+                # Object shoved toward the target zone (no grasp); strict order: after approach.
+                if (near_src or sg.max_reached >= 1) and np.linalg.norm(
+                    self._pos(src) - self._pos(tgt)
+                ) < self.d_tgt:
+                    stage = 2
+            except Exception:  # noqa: BLE001
+                pass
+            return stage
+        # articulation: single "approach the fixture/region" stage before the exact predicate.
+        try:
+            if np.linalg.norm(eef - self._pos(sg.args[0])) < self.d_tgt:
+                return 1
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+    def update(self, obs: dict) -> None:
+        for sg in self.subgoals:
+            cur = self._instant_stage(sg, obs)
+            if cur > sg.max_reached:
+                sg.max_reached = cur
+
+    def episode_progress(self) -> float:
+        if not self.subgoals:
+            return 1.0
+        return float(np.mean([sg.max_reached / len(sg.stages) for sg in self.subgoals]))
+
+    def episode_max_stages(self) -> list:
+        return [sg.max_reached for sg in self.subgoals]
+
+    def template(self) -> list:
+        return [{"pred": sg.pred, "args": sg.args, "stages": sg.stages} for sg in self.subgoals]
+
+
+def _summarize_progress(template: list, ep_progress: list, ep_max_stages: list) -> dict:
+    """Aggregate per-episode stage records for one task into reach-fractions + mean progress."""
+    n_eps = max(len(ep_progress), 1)
+    subgoals = []
+    for j, tmpl in enumerate(template):
+        n_stages = len(tmpl["stages"])
+        reach_fraction = [
+            sum(1 for ms in ep_max_stages if ms[j] >= k) / n_eps for k in range(1, n_stages + 1)
+        ]
+        subgoals.append({**tmpl, "reach_fraction": reach_fraction})
+    return {
+        "mean_episode_progress": float(np.mean(ep_progress)) if ep_progress else 0.0,
+        "subgoals": subgoals,
+        "episode_progress": ep_progress,
+        "episode_max_stages": ep_max_stages,
+    }
 
 
 def eval_libero(args: Args) -> None:
@@ -109,6 +292,13 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
+        stage_eval = (
+            StageEvaluator(env, args.approach_dist, args.place_dist, task_description=task_description)
+            if args.progress_scores
+            else None
+        )
+        task_ep_progress, task_ep_max_stages = [], []
+
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task), desc=f"task{task_id}", leave=False):
             # New episode -> new session so the server resets its KV cache / start frame.
@@ -125,6 +315,8 @@ def eval_libero(args: Args) -> None:
             t = 0
             replay_images = []
             done = False
+            if stage_eval is not None:
+                stage_eval.reset()
             while t < max_steps + args.num_steps_wait:
                 try:
                     if t < args.num_steps_wait:
@@ -163,6 +355,8 @@ def eval_libero(args: Args) -> None:
 
                     action = action_plan.popleft()
                     obs, reward, done, info = env.step(np.asarray(action).tolist())
+                    if stage_eval is not None:
+                        stage_eval.update(obs)
                     if done:
                         break
                     t += 1
@@ -175,6 +369,10 @@ def eval_libero(args: Args) -> None:
             if done:
                 task_successes += 1
                 total_successes += 1
+
+            if stage_eval is not None:
+                task_ep_progress.append(stage_eval.episode_progress())
+                task_ep_max_stages.append(stage_eval.episode_max_stages())
 
             if args.save_videos:
                 suffix = "success" if done else "failure"
@@ -190,16 +388,27 @@ def eval_libero(args: Args) -> None:
 
         env.close()
         task_sr = float(task_successes) / float(max(task_episodes, 1))
-        per_task_metrics.append({
+        task_entry = {
             "task_id": task_id,
             "task_description": task_description,
             "episodes": task_episodes,
             "successes": task_successes,
             "success_rate": task_sr,
-        })
+        }
+        if stage_eval is not None:
+            task_entry["progress"] = _summarize_progress(
+                stage_eval.template(), task_ep_progress, task_ep_max_stages
+            )
+        per_task_metrics.append(task_entry)
         # Persist metrics incrementally so a crash mid-run still leaves partial results.
         _write_metrics(metrics_path, args, per_task_metrics, total_episodes, total_successes, t_start)
-        logging.info("Task %d success rate: %.3f", task_id, task_sr)
+        if stage_eval is not None:
+            logging.info(
+                "Task %d success rate: %.3f | mean progress: %.3f",
+                task_id, task_sr, task_entry["progress"]["mean_episode_progress"],
+            )
+        else:
+            logging.info("Task %d success rate: %.3f", task_id, task_sr)
 
     overall = float(total_successes) / float(max(total_episodes, 1))
     logging.info("==== DONE: overall success rate %.3f (%d/%d) ====", overall, total_successes, total_episodes)
@@ -220,6 +429,12 @@ def _write_metrics(metrics_path, args, per_task_metrics, total_episodes, total_s
         "elapsed_sec": time.time() - t_start,
         "per_task": per_task_metrics,
     }
+    # Overall mean progress = episode-weighted mean across all tasks scored so far.
+    all_ep_progress = [
+        p for tm in per_task_metrics if "progress" in tm for p in tm["progress"]["episode_progress"]
+    ]
+    if all_ep_progress:
+        payload["overall_mean_progress"] = float(np.mean(all_ep_progress))
     with open(metrics_path, "w") as f:
         json.dump(payload, f, indent=2)
 

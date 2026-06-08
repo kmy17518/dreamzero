@@ -53,6 +53,12 @@ def _ckpt_step(path: str):
     return int(m.group(1)) if m else None
 
 
+def _lfs_ckpt_step(filename: str):
+    """Step N for an LFS file under ``checkpoint-N/...`` (None if it isn't under a checkpoint)."""
+    m = re.match(r"checkpoint-(\d+)/", filename)
+    return int(m.group(1)) if m else None
+
+
 def find_all_checkpoints(output_dir: str):
     """All checkpoint-N dirs (complete or not), sorted by step."""
     out = []
@@ -143,9 +149,11 @@ def save_state(state_path, evaluated, failed, results, uploaded):
 # ------------------------------ retention ------------------------------
 def compute_retention(output_dir, keep_latest, keep_best, results, milestone_interval=0, uploaded=None):
     """Return (keep_steps:set, best_steps:list) for latest-L UNION best-M over existing ckpts.
-    Milestone checkpoints (every `milestone_interval` steps) are kept locally until they have been
-    uploaded to the Hub (the Hub is the permanent milestone archive; once uploaded the local copy
-    may be evicted to keep disk lean)."""
+
+    Milestone checkpoints (step % milestone_interval == 0) are additionally kept locally *until they
+    have been uploaded to the Hub* -- after that the Hub is their archive and they may rotate out
+    locally, so local disk stays bounded.
+    """
     all_ck = find_all_checkpoints(output_dir)
     if not all_ck:
         return set(), []
@@ -166,10 +174,11 @@ def compute_retention(output_dir, keep_latest, keep_best, results, milestone_int
 
 def apply_retention(output_dir, keep_latest, keep_best, results, manifest_path,
                     milestone_interval=0, uploaded=None):
-    """Delete complete checkpoints not in latest-L UNION best-M UNION not-yet-uploaded milestones
-    (in place). Never deletes the newest or an in-progress (incomplete) checkpoint. Returns best_steps."""
-    keep, best_steps = compute_retention(output_dir, keep_latest, keep_best, results,
-                                         milestone_interval, uploaded)
+    """Delete complete checkpoints not in latest-L UNION best-M (in place). Never deletes the
+    newest or an in-progress (incomplete) checkpoint. Keeps not-yet-uploaded milestones. Returns
+    best_steps."""
+    keep, best_steps = compute_retention(
+        output_dir, keep_latest, keep_best, results, milestone_interval, uploaded)
     if not keep:
         return best_steps
     complete = {s for s, _ in find_complete_checkpoints(output_dir)}
@@ -201,18 +210,13 @@ class HfUploader(threading.Thread):
     on evict). Updates the `uploaded` set + state via the provided callbacks."""
 
     def __init__(self, repo_id, repo_type, model_only, private, token,
-                 mark_uploaded, mark_deleted, squash_interval=900):
+                 mark_uploaded, mark_deleted):
         super().__init__(daemon=True)
         self.repo_id = repo_id
         self.repo_type = repo_type
         self.model_only = model_only
         self.mark_uploaded = mark_uploaded
         self.mark_deleted = mark_deleted
-        # HF bills LFS blobs across the WHOLE commit history, so delete_folder() alone never frees
-        # space (the blob lingers in history). Periodically squash history -> 1 commit of the current
-        # state so evicted checkpoints' blobs become unreferenced and get GC'd. Throttled.
-        self.squash_interval = squash_interval
-        self._last_squash = 0.0
         self.q: "queue.Queue" = queue.Queue()
         self._stop = threading.Event()
         from huggingface_hub import HfApi
@@ -227,24 +231,6 @@ class HfUploader(threading.Thread):
 
     def stop(self):
         self._stop.set()
-
-    def _maybe_squash(self, force=False):
-        """Collapse repo history to a single commit so blobs from evicted checkpoints are no longer
-        referenced (and thus reclaimed by the Hub). Without this, deletes keep accumulating in
-        history and HF keeps billing them. Throttled to once per `squash_interval` seconds."""
-        now = time.time()
-        if not force and (now - self._last_squash) < self.squash_interval:
-            return
-        try:
-            self.api.super_squash_history(
-                repo_id=self.repo_id,
-                repo_type=self.repo_type,
-                commit_message="squash history to reclaim evicted-checkpoint LFS storage",
-            )
-            self._last_squash = now
-            log(f"upload: squashed history of {self.repo_id} (reclaim evicted-ckpt storage)")
-        except Exception as e:  # noqa: BLE001
-            log(f"upload: squash history failed (will retry): {e}")
 
     def run(self):
         while not self._stop.is_set():
@@ -277,20 +263,28 @@ class HfUploader(threading.Thread):
                         )
                     except Exception as e:  # noqa: BLE001
                         log(f"upload: delete checkpoint-{step} (likely already gone): {e}")
-                    # delete_folder only removes the pointer; the LFS/Xet blob lingers in storage and
-                    # is still billed. Permanently delete the now-unreferenced blobs to actually reclaim.
-                    try:
-                        victims = [f for f in self.api.list_lfs_files(self.repo_id, repo_type=self.repo_type)
-                                   if (f.filename or "").startswith(f"checkpoint-{step}/")]
-                        if victims:
-                            self.api.permanently_delete_lfs_files(
-                                self.repo_id, victims, repo_type=self.repo_type)
-                            log(f"upload: permanently deleted {len(victims)} LFS blobs of checkpoint-{step}")
-                    except Exception as e:  # noqa: BLE001
-                        log(f"upload: permanent LFS delete of checkpoint-{step} failed: {e}")
                     self.mark_deleted(step)
                     log(f"upload: removed checkpoint-{step} from {self.repo_id}")
-                    self._maybe_squash()  # tidy git history (blobs already permanently deleted above)
+                elif action == "reclaim":
+                    # delete_folder() only drops a checkpoint from HEAD; HF bills LFS/Xet blobs across
+                    # the WHOLE commit history, so squashing/deleting from HEAD never frees storage.
+                    # permanently_delete_lfs_files() is the real reclaim: drop every LFS blob NOT
+                    # under a kept checkpoint (also cleans pre-existing orphans). `src` = keep steps.
+                    keep_steps = src or frozenset()
+                    lfs = list(self.api.list_lfs_files(self.repo_id, repo_type=self.repo_type))
+                    to_del = [f for f in lfs
+                              if _lfs_ckpt_step(f.filename) is not None
+                              and _lfs_ckpt_step(f.filename) not in keep_steps]
+                    if to_del:
+                        gb = sum(f.size for f in to_del) / 1e9
+                        steps = sorted({_lfs_ckpt_step(f.filename) for f in to_del})
+                        log(f"upload: permanently deleting {len(to_del)} LFS blobs (~{gb:.0f} GB) "
+                            f"from checkpoints {steps} to reclaim Hub storage")
+                        self.api.permanently_delete_lfs_files(
+                            self.repo_id, to_del, rewrite_history=True, repo_type=self.repo_type)
+                        log(f"upload: reclaimed ~{gb:.0f} GB from {self.repo_id}")
+                    else:
+                        log(f"upload: reclaim -- no orphaned LFS blobs in {self.repo_id}")
             except Exception as e:  # noqa: BLE001
                 log(f"upload: FAILED {action} checkpoint-{step}: {e}")
             finally:
@@ -327,7 +321,10 @@ def start_server(args, ckpt_dir: str, server_log_path: str) -> subprocess.Popen:
         "--tokenizer_path", args.tokenizer_path,
         "--host", "127.0.0.1",
         "--port", str(args.port),
+        "--context_mode", args.context_mode,
     ]
+    if args.save_video_pred:
+        cmd += ["--save_video_pred", "--video_output_dir", args.video_pred_dir]
     log(f"starting server: CUDA_VISIBLE_DEVICES={args.server_gpu} {' '.join(cmd)}")
     fh = open(server_log_path, "w")
     return subprocess.Popen(
@@ -365,6 +362,7 @@ def run_client(args, step, eval_out_root) -> str | None:
         "--host", "127.0.0.1", "--port", str(args.port),
         "--task-suite-name", args.task_suite_name,
         "--num-trials-per-task", str(args.num_trials_per_task),
+        "--replan-steps", str(args.replan_steps),
         "--video-out-path", videos_dir,
         "--metrics-out-path", metrics_path,
     ]
@@ -390,6 +388,22 @@ def main():
     ap.add_argument("--task-suite-name", default="libero_spatial")
     ap.add_argument("--num-trials-per-task", type=int, default=10)
     ap.add_argument("--max-tasks", type=int, default=0)
+    # Explicit-conditioning eval knobs (forwarded to the server/client; default = baseline eval).
+    ap.add_argument("--context-mode", default="baseline", choices=["baseline", "C"],
+                    help="cross-query video conditioning scheme on the policy server: 'baseline' "
+                         "(original eval, generated video discarded across queries) or 'C' (grounded "
+                         "explicit conditioning: re-anchor on the current real obs + the previously "
+                         "generated frontier block each query)")
+    ap.add_argument("--replan-steps", type=int, default=5,
+                    help="actions executed per query before re-querying. For feedback modes "
+                         "(--context-mode C) set this to num_action_per_block (24) so 1 query = 1 "
+                         "block and the fed-back frontier aligns 1:1 with the next real observation; "
+                         "baseline uses 5 (more reactive closed-loop control)")
+    ap.add_argument("--save-video-pred", action="store_true",
+                    help="have the server save the model's generated/imagined video per episode "
+                         "(useful to inspect what context_mode=C is feeding back)")
+    ap.add_argument("--video-pred-dir", default="./video_pred_output",
+                    help="output dir for --save-video-pred (a checkpoint-N subdir is appended)")
     ap.add_argument("--max-steps-override", type=int, default=0)
     ap.add_argument("--save-videos", action="store_true", default=True)
     ap.add_argument("--no-save-videos", dest="save_videos", action="store_false")
@@ -409,9 +423,6 @@ def main():
                          "watcher-managed retention; the watcher becomes the sole pruner)")
     ap.add_argument("--keep-latest-n", type=int, default=5,
                     help="also always keep the latest-N checkpoints by step (default 5)")
-    ap.add_argument("--milestone-interval", type=int, default=0,
-                    help="permanently keep every Nth-step checkpoint as a milestone on the Hub "
-                         "(e.g. 5000 -> keep 5000,10000,15000,...; 0 disables)")
     # wandb
     ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--wandb-run-id", default=None)
@@ -421,10 +432,17 @@ def main():
     ap.add_argument("--upload-repo", default=None,
                     help="HF Hub repo id (e.g. user/dreamzero-libero-best) to mirror best-M into")
     ap.add_argument("--upload-repo-type", default="model", choices=["model", "dataset"])
+    ap.add_argument("--upload-best-n", type=int, default=2,
+                    help="number of best-by-success checkpoints to mirror to the Hub, IN ADDITION "
+                         "to the latest complete checkpoint (should be <= --keep-best-n)")
     ap.add_argument("--upload-model-only", action="store_true",
                     help="upload model-only (no optimizer) to the Hub -- much smaller/faster "
                          "(default uploads the full, resumable checkpoint)")
     ap.add_argument("--upload-public", action="store_true", help="make the Hub repo public (default private)")
+    ap.add_argument("--milestone-interval", type=int, default=0,
+                    help="keep every Nth-step checkpoint as a PERMANENT milestone on the Hub (e.g. "
+                         "5000 -> 5000,10000,15000,...), in addition to best-N + latest. Milestones "
+                         "are kept locally only until uploaded (the Hub is the archive). 0 disables.")
     args = ap.parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
@@ -476,33 +494,41 @@ def main():
 
     log(f"watching {output_dir} | server-gpu={args.server_gpu} | suite={args.task_suite_name} "
         f"trials/task={args.num_trials_per_task} max_tasks={args.max_tasks or 'all'} | "
+        f"context_mode={args.context_mode} replan_steps={args.replan_steps} | "
         f"latest_only={args.latest_only} | keep_latest={args.keep_latest_n} keep_best={args.keep_best_n}"
-        + (f" | upload->{args.upload_repo}" if uploader else ""))
+        + (f" | upload->{args.upload_repo} (best-{args.upload_best_n} + latest"
+           f"{f' + milestones/{args.milestone_interval}' if args.milestone_interval else ''}"
+           f", reclaim-on-evict)" if uploader else ""))
 
     def sync_uploads(best_steps):
         if uploader is None:
             return
-        # HF mirror = best-N (by success rate) UNION the latest complete checkpoint, so the most
-        # recent training state is always resumable from the Hub even before it is (or if it never
-        # becomes) a top scorer. Anything previously uploaded that is no longer in this set is removed.
-        upload_set = set(best_steps)
+        # HF mirror = best-`--upload-best-n` (by success) UNION the latest complete checkpoint UNION
+        # every milestone (step % --milestone-interval == 0). Milestones are PERMANENT (never
+        # evicted); best/latest rotate. `best_steps` is ranked best-first.
+        upload_set = set(best_steps[: args.upload_best_n])
         complete = [s for s, _ in find_complete_checkpoints(output_dir)]
         if complete:
             upload_set.add(max(complete))
-        # HF is the permanent milestone archive: always keep every milestone checkpoint that is
-        # already uploaded or currently available locally; milestones are never evicted from the Hub.
-        mi = args.milestone_interval
-        if mi and mi > 0:
-            upload_set |= {s for s in uploaded if s % mi == 0}
-            upload_set |= {s for s in complete if s % mi == 0}
+        if args.milestone_interval and args.milestone_interval > 0:
+            # already-archived milestones (kept even once they're no longer local) + new local ones
+            upload_set |= {s for s in uploaded if s % args.milestone_interval == 0}
+            upload_set |= {s for s in complete if s % args.milestone_interval == 0}
         for s in sorted(upload_set):
             if s in uploaded:
                 continue
             src = os.path.join(output_dir, f"checkpoint-{s}")
             if os.path.isdir(src):
                 uploader.enqueue("up", s, src)
-        for s in sorted(uploaded - upload_set):
+        evicted = sorted(uploaded - upload_set)
+        for s in evicted:
             uploader.enqueue("del", s)
+        # delete_folder() only drops the checkpoint from HEAD; HF bills LFS blobs across the whole
+        # commit history, so it never frees storage. After an eviction, permanently delete every LFS
+        # blob not under a kept checkpoint (this also cleans pre-existing orphans). Queued after the
+        # "del"s; `src` carries the keep set.
+        if evicted:
+            uploader.enqueue("reclaim", -1, src=frozenset(upload_set))
 
     try:
         while True:
@@ -563,7 +589,7 @@ def main():
                     if args.keep_best_n > 0:
                         best_steps = apply_retention(
                             output_dir, args.keep_latest_n, args.keep_best_n, results, manifest_path,
-                    args.milestone_interval, uploaded)
+                            args.milestone_interval, uploaded)
                         sync_uploads(best_steps)
             else:
                 finished = os.path.isfile(os.path.join(output_dir, "config.json"))

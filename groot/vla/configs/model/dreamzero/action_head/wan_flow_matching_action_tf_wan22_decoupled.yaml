@@ -1,0 +1,23 @@
+# @package _global_
+# Decoupled action/dynamics variant of the Wan2.2-TI2V-5B action head.
+# Identical to wan_flow_matching_action_tf_wan22 EXCEPT that action tokens are prevented from
+# attending to the noisy / being-generated ("future") video tokens during denoising. Action tokens
+# STILL attend to the clean observation context (current + past frames), their own action block,
+# and their state block. Video tokens are unchanged (they still attend to action tokens), and BOTH
+# the dynamics (video) and action flow-matching losses are still optimized jointly. This decouples
+# the action pathway from the generated-video pathway ("action loss / dynamics loss decoupled")
+# at the attention level, without dropping either loss.
+#
+# The flag is implemented inside the DiT (CausalWanModel -> CausalWanAttentionBlock ->
+# CausalWanSelfAttention) and is set on the diffusion model config so it is persisted in the saved
+# checkpoint's config.json -> it is automatically applied at eval as well (no eval flag needed).
+#
+# Select with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_decoupled
+
+defaults:
+  - wan_flow_matching_action_tf_wan22
+
+action_head_cfg:
+  config:
+    diffusion_model_cfg:
+      decouple_action_dynamics: true

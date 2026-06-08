@@ -32,6 +32,7 @@ The LIBERO client (eval_utils/run_libero_eval.py) sends, per step:
 Response: {"actions": (N, 7)} float32.
 """
 
+import copy
 import datetime
 import logging
 import os
@@ -156,11 +157,31 @@ class DreamZeroLiberoPolicy(BasePolicy):
         embodiment_tag: str = "libero_sim",
         save_video_pred: bool = False,
         video_output_dir: str = "./video_pred_output",
+        future_frame_shift: bool | None = None,
+        context_mode: str = "baseline",
     ):
         super().__init__()
         self._policy = groot_policy
         self._image_height = image_height
         self._image_width = image_width
+        # Explicit-conditioning future-frame shift: the model predicts video one block ahead of the
+        # action it co-produces, so the first generated block carries the unsupervised a_{-1} chunk.
+        # We prime once per episode (return a no-op for the first query) so the KV cache advances and
+        # every subsequent query returns a correctly-aligned action (query N -> a_{N-2}; the robot is
+        # at window N-2 after the one-query idle). Auto-detected from the trained model's config.
+        detected_ffs = False
+        try:
+            detected_ffs = bool(
+                getattr(groot_policy.trained_model.action_head.config, "future_frame_shift", False)
+            )
+        except Exception:  # noqa: BLE001 - config layout may vary; default to off
+            detected_ffs = False
+        self._future_frame_shift = detected_ffs if future_frame_shift is None else future_frame_shift
+        if self._future_frame_shift:
+            logger.info(
+                "future_frame_shift ON: priming first query of each episode with a no-op chunk "
+                "(discards the unsupervised a_{-1}); later queries are correctly aligned."
+            )
         if embodiment_tag not in EMB_CONFIG:
             raise ValueError(
                 f"Unsupported embodiment_tag={embodiment_tag}; expected one of {list(EMB_CONFIG)}"
@@ -175,6 +196,28 @@ class DreamZeroLiberoPolicy(BasePolicy):
         self._video_output_dir = video_output_dir
         self._video_pred_latents: list[torch.Tensor] = []
         self._current_prompt: str = ""
+        # Cross-query video conditioning scheme:
+        #   "baseline" : original DreamZero eval (re-grounds on real obs each query; generated
+        #                video is discarded across queries). Byte-for-byte unchanged.
+        #   "C"        : grounded explicit conditioning. Every query re-anchors on the CURRENT real
+        #                obs and primes ONLY the previously generated block as the frontier, so the
+        #                KV cache is rebuilt each query as [real anchor, one generated frontier] and
+        #                generations never accumulate. Requires future_frame_shift (auto-detected).
+        if context_mode not in ("baseline", "C"):
+            raise ValueError(
+                f"Unsupported context_mode={context_mode}; expected one of ['baseline', 'C']"
+            )
+        self._context_mode = context_mode
+        self._frontier_latent: torch.Tensor | None = None
+        ah = getattr(self._policy.trained_model, "action_head", None)
+        if ah is not None:
+            ah.grounded_context = (context_mode == "C")
+        if context_mode == "C":
+            logger.info(
+                "context_mode=C (grounded explicit conditioning): each query re-anchors on the current "
+                "real observation and primes only the previously generated block as the frontier; the "
+                "KV cache is rebuilt every query as [real anchor, generated frontier] (no accumulation)."
+            )
 
     def _convert_observation(self, obs: dict) -> dict:
         agent = obs.get("observation/image")
@@ -249,14 +292,61 @@ class DreamZeroLiberoPolicy(BasePolicy):
 
         converted_obs = self._convert_observation(obs)
         batch = Batch(obs=converted_obs)
+
+        # Grounded explicit conditioning (context_mode=C): force a fresh real-anchored sequence each
+        # query and hand the head the previous query's generated block as the single frontier. The
+        # episode-start no-op is still emitted by the future-frame-shift logic below (frontier is None
+        # at q0 -> current_start_frame lands on 1+nfpb -> no-op); every later query returns the aligned
+        # action directly because the frontier prime advances the cache past the a_{-1} slot.
+        latent_video = None
+        ah = getattr(self._policy.trained_model, "action_head", None)
+        if self._context_mode == "C":
+            if ah is not None:
+                ah.grounded_context = True
+                ah.current_start_frame = 0
+            latent_video = self._frontier_latent
+
         with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, latent_video=latent_video)
         if self._save_video_pred and video_pred is not None:
             self._video_pred_latents.append(video_pred.detach())
+
+        # Cache the just-generated frontier block (last num_frame_per_block latent frames) so the next
+        # query conditions on it as the grounded frontier.
+        if self._context_mode == "C" and video_pred is not None:
+            nfpb = int(getattr(ah, "num_frame_per_block", 2)) if ah is not None else 2
+            self._frontier_latent = video_pred[:, :, -nfpb:].clone()
 
         action_chunk = result_batch.act
         action_dict = {k: v for k, v in action_chunk.items() if k.startswith("action.")}
         action = self._convert_action(action_dict)
+
+        # Future-frame shift priming. The shifted model emits the action one block behind the video,
+        # so the FIRST generated block of every autoregressive sequence carries the unsupervised
+        # a_{-1} chunk. A fresh sequence happens at episode start AND every time the action head
+        # resets its KV cache (current_start_frame >= local_attn_size, ~every max_chunk_size queries).
+        # Detect it via current_start_frame == 1 + num_frame_per_block (warmup +1, then one block):
+        #   - episode start (single obs frame): idle one query (no-op); the next query returns a_0.
+        #   - mid-episode reset (>=FRAMES_PER_CHUNK obs frames): regenerate once on the same obs to
+        #     fetch the aligned a_0 (avoids a recurring ~replan_steps idle at every cache reset).
+        if self._future_frame_shift:
+            ah = getattr(self._policy.trained_model, "action_head", None)
+            nfpb = int(getattr(ah, "num_frame_per_block", 2)) if ah is not None else 2
+            cf = int(getattr(ah, "current_start_frame", -1)) if ah is not None else -1
+            if cf == 1 + nfpb:  # just generated a fresh sequence's first block -> a_{-1}
+                if self._is_first_call:
+                    logger.info("[future_frame_shift] episode start: returning no-op priming chunk (discarded a_{-1}).")
+                    action = np.zeros_like(action)
+                else:
+                    logger.info("[future_frame_shift] cache reset (cf=%d): regenerating aligned chunk a_0.", cf)
+                    batch2 = Batch(obs=copy.deepcopy(converted_obs))
+                    with torch.no_grad():
+                        result_batch2, video_pred2 = self._policy.lazy_joint_forward_causal(batch2)
+                    if self._save_video_pred and video_pred2 is not None:
+                        self._video_pred_latents.append(video_pred2.detach())
+                    action_dict2 = {k: v for k, v in result_batch2.act.items() if k.startswith("action.")}
+                    action = self._convert_action(action_dict2)
+
         if self._is_first_call:
             self._is_first_call = False
         return {"actions": action}
@@ -292,6 +382,7 @@ class DreamZeroLiberoPolicy(BasePolicy):
         if self._save_video_pred:
             self._save_predicted_video()
         self._video_pred_latents.clear()
+        self._frontier_latent = None
         self._current_prompt = ""
         for key in self._frame_buffers:
             self._frame_buffers[key] = []
@@ -315,6 +406,8 @@ def main(
     save_video_pred: bool = False,
     video_output_dir: str = "./video_pred_output",
     model_config_overrides: list[str] | None = None,
+    future_frame_shift: bool | None = None,
+    context_mode: str = "baseline",
 ) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
 
@@ -346,6 +439,8 @@ def main(
         embodiment_tag=embodiment_tag,
         save_video_pred=save_video_pred,
         video_output_dir=video_output_dir,
+        future_frame_shift=future_frame_shift,
+        context_mode=context_mode,
     )
 
     server_config = PolicyServerConfig(

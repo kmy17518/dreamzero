@@ -121,6 +121,16 @@ class WANPolicyHeadConfig(PretrainedConfig):
     video_inference_final_noise: float = field(
         default=0.8, metadata={"help": "Final noise level for video during decoupled inference (0.0-1.0). E.g., 0.8 means video ends at 80% noise."}
     )
+    # ========== ACTION-LOSS-ONLY TRAINING ==========
+    # When True, the optimized training loss is ONLY the action flow-matching loss. The video
+    # dynamics loss is still computed and logged (train/dynamics_loss) for monitoring, but is
+    # excluded from the gradient (multiplied by 0 so video-only params still receive a zero
+    # gradient, avoiding DDP/DeepSpeed unused-parameter errors). Default False preserves the
+    # original joint (dynamics + action) objective, so existing configs are unaffected.
+    action_loss_only: bool = field(
+        default=False,
+        metadata={"help": "Optimize only the action loss; dynamics loss is logged but not trained."},
+    )
     num_timestep_buckets: int = field(
         default=1000, metadata={"help": "Number of timestep discretization buckets."}
     )
@@ -142,6 +152,21 @@ class WANPolicyHeadConfig(PretrainedConfig):
     expand_batch: int = field(default=None)
     use_vlln: bool = field(default=True)
     defer_lora_injection: bool = field(default=False, metadata={"help": "Defer LoRA injection until after loading pretrained weights."})
+
+    # Explicit-conditioning "future-frame shift". When enabled the joint DiT predicts the video
+    # block one step ahead of the action/state it is grouped with: register slot b becomes
+    # (video o_b, action a_{b-1}, state s_{b-1}) instead of the aligned (o_b, a_b, s_b). The video
+    # diffusion pipeline is untouched; only the action/state register is rolled back
+    # `future_frame_shift_blocks` block(s) and the now-unsupervised leading block(s) are masked
+    # out of the action loss. See docs/LIBERO_EXPLICIT_CONDITIONING.md.
+    future_frame_shift: bool = field(
+        default=False,
+        metadata={"help": "Predict video one block ahead of the action/state (explicit conditioning)."},
+    )
+    future_frame_shift_blocks: int = field(
+        default=1,
+        metadata={"help": "Number of blocks the video leads the action/state by (default 1)."},
+    )
 
     vl_self_attention_cfg: dict = field(default=None)
     text_encoder_cfg: dict = field(default=None)
@@ -197,6 +222,12 @@ class WANPolicyHead(ActionHead):
         self.clip_feas = None
         self.ys = None
         self.current_start_frame = 0
+        # Grounded explicit conditioning (eval context_mode=C). When True the server forces a fresh
+        # sequence every query (current_start_frame=0) and hands the previously generated block in via
+        # `latent_video`; that block is primed as the single clean context block right after the real
+        # anchor, so the KV cache is always [real anchor, one generated frontier] and never accumulates
+        # the model's own generations. Default False -> baseline/training behavior is unchanged.
+        self.grounded_context = False
         self.language = None
 
         self.ip_rank = 0
@@ -617,6 +648,32 @@ class WANPolicyHead(ActionHead):
         # assert the values of action is in between -1 and 1
         if actions.numel() > 0:
             assert actions.min() >= -1.0 and actions.max() <= 1.0, "actions must be in [-1,1] range"
+
+        # ===== Explicit-conditioning future-frame shift =====
+        # Roll the action+state register back `shift_blocks` block(s) so the model predicts the
+        # video block one step ahead of the action/state it co-produces:
+        #     register slot b -> (video o_b, action a_{b-1}, state s_{b-1})   (here shift=1)
+        # Equivalent to "shifting the video timestep into the future" relative to the action.
+        # The video diffusion target is left untouched; we only reindex the action/state tensors
+        # and mask the leading block(s) (a_{-1}, s_{-1}) which have no valid target.
+        if getattr(self.config, "future_frame_shift", False):
+            shift_blocks = int(getattr(self.config, "future_frame_shift_blocks", 1))
+            if shift_blocks > 0:
+                if actions.numel() > 0:
+                    n_act = shift_blocks * self.model.num_action_per_block  # action tokens / block
+                    assert n_act < actions.shape[1], (
+                        f"future_frame_shift_blocks={shift_blocks} too large for "
+                        f"{actions.shape[1] // self.model.num_action_per_block} action blocks"
+                    )
+                    actions = torch.roll(actions, shifts=n_act, dims=1)
+                    actions[:, :n_act] = 0.0  # discard the wrapped-around last block(s)
+                    action_mask = torch.roll(action_mask, shifts=n_act, dims=1)
+                    action_mask[:, :n_act] = False  # leading block(s) unsupervised (a_{-1})
+                # one state token per block -> roll along the block (time) axis
+                if state_features.numel() > 0 and state_features.shape[1] > shift_blocks:
+                    state_features = torch.roll(state_features, shifts=shift_blocks, dims=1)
+                    state_features[:, :shift_blocks] = 0.0
+
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
@@ -797,7 +854,14 @@ class WANPolicyHead(ActionHead):
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
                 weighted_action_loss = weight_action.mean()
-                loss = weighted_dynamics_loss + weighted_action_loss
+                if getattr(self.config, "action_loss_only", False):
+                    # Action-loss-only training: optimize the action loss alone. Keep the dynamics
+                    # loss in the graph with a 0 coefficient so video-only params still receive a
+                    # (zero) gradient -> avoids DDP/DeepSpeed "parameter did not receive grad"
+                    # errors. The unweighted dynamics_loss is still logged below for monitoring.
+                    loss = weighted_action_loss + 0.0 * weighted_dynamics_loss
+                else:
+                    loss = weighted_dynamics_loss + weighted_action_loss
             else:
                 weighted_action_loss = torch.tensor(0.0, device=self._device)
                 loss = weighted_dynamics_loss
@@ -1164,7 +1228,40 @@ class WANPolicyHead(ActionHead):
             
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
-        if self.current_start_frame != 1:
+        # ===== Grounded explicit conditioning (context_mode=C) =====
+        # The server forces a fresh sequence every query (current_start_frame reset to 0), so the real
+        # current observation was just primed as the anchor at position 0 (current_start_frame == 1 now).
+        # Prime the single stored generated frontier block (passed in via `latent_video`) as the next
+        # clean context block. This both (a) injects the explicit-conditioning signal and (b) advances
+        # current_start_frame past the unsupervised a_{-1} slot, so the generation below yields the
+        # aligned action directly (no regeneration needed). At episode start there is no frontier yet,
+        # so this is skipped and generation falls through anchored on the real frame alone.
+        if getattr(self, "grounded_context", False) and latent_video is not None and self.current_start_frame == 1:
+            if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+            else:
+                y = self.ys[:, :, -self.num_frame_per_block:]
+            self._run_diffusion_steps(
+                noisy_input=latent_video,
+                timestep=timestep * 0,
+                action=None,
+                timestep_action=None,
+                state=None,
+                embodiment_id=None,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=self.current_start_frame,
+                    update_kv_cache=True,
+                ),
+            )
+            self.current_start_frame += self.num_frame_per_block
+
+        if self.current_start_frame != 1 and not getattr(self, "grounded_context", False):
             current_ref_latents = image[:, -self.num_frame_per_block:]
             if self.current_start_frame <= self.ys.shape[2]:
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]

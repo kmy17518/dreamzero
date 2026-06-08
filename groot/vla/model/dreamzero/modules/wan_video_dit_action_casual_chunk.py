@@ -197,7 +197,10 @@ class CausalWanSelfAttention(nn.Module):
                  qk_norm=True,
                  eps=1e-6,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 decouple_action_dynamics=False,
+                 decouple_dynamics_action=False,
+                 action_skip_noisy_video=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -212,6 +215,24 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_seqlen = frame_seqlen
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
+        # `action_skip_noisy_video` (action-loss-only branch) and `decouple_action_dynamics`
+        # (decoupled branch) name the SAME action->video cut: the action/state register attends to
+        # the clean video stream + its own register but NOT the noisy video block being denoised.
+        # They are unified here (alias) so both flag names — and both branches' saved checkpoint
+        # configs — work. `action_skip_noisy_video` is retained as an accepted kwarg for backward
+        # compatibility with checkpoints whose config.json sets it.
+        self.action_skip_noisy_video = action_skip_noisy_video
+        # When True, action tokens do NOT attend to the noisy (being-generated / "future") video
+        # tokens; they attend only to the clean observation context + their own block + state.
+        # This decouples the action pathway from the video-dynamics pathway. Default False keeps
+        # the original joint behavior so existing configs are unaffected.
+        self.decouple_action_dynamics = decouple_action_dynamics or action_skip_noisy_video
+        # When True, the noisy / being-generated video ("dynamics") tokens do NOT attend to the
+        # action block, i.e. it removes the video->action link. This is the mirror of
+        # decouple_action_dynamics (which removes the action->video link). Enabling BOTH yields a
+        # fully bidirectionally-decoupled action/video pathway (they then share only the clean
+        # observation context + their own state). Default False keeps the original joint behavior.
+        self.decouple_dynamics_action = decouple_dynamics_action
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -262,10 +283,11 @@ class CausalWanSelfAttention(nn.Module):
                 image_kv_start = image_blocks_start
             mask[block_start:block_end, image_kv_start:block_end] = True
             
-            # Attend to current action block
+            # Attend to current action block (unless the video->action link is decoupled)
             action_block_start = action_start + block_idx * num_action_per_block
             action_block_end = action_start + (block_idx + 1) * num_action_per_block
-            mask[block_start:block_end, action_block_start:action_block_end] = True
+            if not self.decouple_dynamics_action:
+                mask[block_start:block_end, action_block_start:action_block_end] = True
             
             # Attend to current state block
             state_block_start = state_start + block_idx * num_state_per_block
@@ -489,19 +511,33 @@ class CausalWanSelfAttention(nn.Module):
             state_block_start = state_block_starts[block_idx]
             state_block_end = state_block_ends[block_idx]
             
-            # Build context: first image + relevant image blocks + current action + current state
-            k_context = torch.cat([
-                k[:, first_image_start:first_image_end],  # First image
-                k[:, image_kv_start:block_end],  # Image blocks
-                k[:, action_block_start:action_block_end],  # Current action block
-                k[:, state_block_start:state_block_end]  # Current state block
-            ], dim=1)
-            v_context = torch.cat([
-                v[:, first_image_start:first_image_end],
-                v[:, image_kv_start:block_end],
-                v[:, action_block_start:action_block_end],
-                v[:, state_block_start:state_block_end]
-            ], dim=1)
+            # Build context: first image + relevant image blocks + current action + current state.
+            # When decouple_dynamics_action is on, the video drops the current action block (removes
+            # the video->action link); it still attends to its own state block.
+            if self.decouple_dynamics_action:
+                k_context = torch.cat([
+                    k[:, first_image_start:first_image_end],  # First image
+                    k[:, image_kv_start:block_end],  # Image blocks
+                    k[:, state_block_start:state_block_end]  # Current state block
+                ], dim=1)
+                v_context = torch.cat([
+                    v[:, first_image_start:first_image_end],
+                    v[:, image_kv_start:block_end],
+                    v[:, state_block_start:state_block_end]
+                ], dim=1)
+            else:
+                k_context = torch.cat([
+                    k[:, first_image_start:first_image_end],  # First image
+                    k[:, image_kv_start:block_end],  # Image blocks
+                    k[:, action_block_start:action_block_end],  # Current action block
+                    k[:, state_block_start:state_block_end]  # Current state block
+                ], dim=1)
+                v_context = torch.cat([
+                    v[:, first_image_start:first_image_end],
+                    v[:, image_kv_start:block_end],
+                    v[:, action_block_start:action_block_end],
+                    v[:, state_block_start:state_block_end]
+                ], dim=1)
             
             output[:, block_start:block_end] = self.attn(
                 q[:, block_start:block_end], k_context, v_context
@@ -511,9 +547,15 @@ class CausalWanSelfAttention(nn.Module):
         for block_idx in range(num_action_blocks):
             action_block_start = action_block_starts[block_idx]
             action_block_end = action_block_ends[block_idx]
+            image_block_start = image_block_starts[block_idx]
             image_block_end = image_block_ends[block_idx]
             state_block_start = state_block_starts[block_idx]
             state_block_end = state_block_ends[block_idx]
+            
+            # When decoupled, the action only sees image blocks STRICTLY BEFORE the current block
+            # (the observations), never the current block being generated. Otherwise it sees up to
+            # and including the current image block.
+            image_kv_end = image_block_start if self.decouple_action_dynamics else image_block_end
             
             # Determine image context range
             if self.local_attn_size != -1:
@@ -524,13 +566,13 @@ class CausalWanSelfAttention(nn.Module):
             # Build context
             k_context = torch.cat([
                 k[:, first_image_start:first_image_end],  # First image
-                k[:, image_kv_start:image_block_end],  # Image blocks
+                k[:, image_kv_start:image_kv_end],  # Image blocks (excludes current block if decoupled)
                 k[:, action_block_start:action_block_end],  # Current action block
                 k[:, state_block_start:state_block_end]  # Current state block
             ], dim=1)
             v_context = torch.cat([
                 v[:, first_image_start:first_image_end],
-                v[:, image_kv_start:image_block_end],
+                v[:, image_kv_start:image_kv_end],
                 v[:, action_block_start:action_block_end],
                 v[:, state_block_start:state_block_end]
             ], dim=1)
@@ -706,19 +748,32 @@ class CausalWanSelfAttention(nn.Module):
             
             q_block = noisy_image_q[:, noisy_start:noisy_end]
             
-            # Build context: first_clean_frame + clean_blocks[0:i] + current_noisy_block + action[i] + state[i]
-            k_context = torch.cat([
-                clean_image_k[:, :clean_end],
-                noisy_image_k[:, noisy_start:noisy_end],
-                noisy_action_k[:, action_start:action_end],
-                noisy_state_k[:, state_start:state_end]
-            ], dim=1)
-            v_context = torch.cat([
-                clean_image_v[:, :clean_end],
-                noisy_image_v[:, noisy_start:noisy_end],
-                noisy_action_v[:, action_start:action_end],
-                noisy_state_v[:, state_start:state_end]
-            ], dim=1)
+            # Build context: first_clean_frame + clean_blocks[0:i] + current_noisy_block + action[i] + state[i].
+            # When decouple_dynamics_action is on, drop action[i] so the video has no video->action link.
+            if self.decouple_dynamics_action:
+                k_context = torch.cat([
+                    clean_image_k[:, :clean_end],
+                    noisy_image_k[:, noisy_start:noisy_end],
+                    noisy_state_k[:, state_start:state_end]
+                ], dim=1)
+                v_context = torch.cat([
+                    clean_image_v[:, :clean_end],
+                    noisy_image_v[:, noisy_start:noisy_end],
+                    noisy_state_v[:, state_start:state_end]
+                ], dim=1)
+            else:
+                k_context = torch.cat([
+                    clean_image_k[:, :clean_end],
+                    noisy_image_k[:, noisy_start:noisy_end],
+                    noisy_action_k[:, action_start:action_end],
+                    noisy_state_k[:, state_start:state_end]
+                ], dim=1)
+                v_context = torch.cat([
+                    clean_image_v[:, :clean_end],
+                    noisy_image_v[:, noisy_start:noisy_end],
+                    noisy_action_v[:, action_start:action_end],
+                    noisy_state_v[:, state_start:state_end]
+                ], dim=1)
             
             output[:, noisy_start:noisy_end] = self.attn(q_block, k_context, v_context)
         
@@ -765,19 +820,35 @@ class CausalWanSelfAttention(nn.Module):
             
             q_block = noisy_action_q[:, action_start:action_end]
             
-            # Build context: first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
-            k_context = torch.cat([
-                clean_image_k[:, :clean_end],
-                noisy_image_k[:, noisy_img_start:noisy_img_end],
-                noisy_action_k[:, action_start:action_end],
-                noisy_state_k[:, state_start:state_end]
-            ], dim=1)
-            v_context = torch.cat([
-                clean_image_v[:, :clean_end],
-                noisy_image_v[:, noisy_img_start:noisy_img_end],
-                noisy_action_v[:, action_start:action_end],
-                noisy_state_v[:, state_start:state_end]
-            ], dim=1)
+            if self.decouple_action_dynamics:
+                # DECOUPLED: the action block attends ONLY to the clean observation context
+                # (first_clean_frame + clean_blocks[0:i]) + its own action block + its state
+                # block. It does NOT attend to noisy_image[i] (the "future"/being-generated
+                # video for this block), so the action pathway cannot peek at the generated video.
+                k_context = torch.cat([
+                    clean_image_k[:, :clean_end],
+                    noisy_action_k[:, action_start:action_end],
+                    noisy_state_k[:, state_start:state_end]
+                ], dim=1)
+                v_context = torch.cat([
+                    clean_image_v[:, :clean_end],
+                    noisy_action_v[:, action_start:action_end],
+                    noisy_state_v[:, state_start:state_end]
+                ], dim=1)
+            else:
+                # Build context: first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
+                k_context = torch.cat([
+                    clean_image_k[:, :clean_end],
+                    noisy_image_k[:, noisy_img_start:noisy_img_end],
+                    noisy_action_k[:, action_start:action_end],
+                    noisy_state_k[:, state_start:state_end]
+                ], dim=1)
+                v_context = torch.cat([
+                    clean_image_v[:, :clean_end],
+                    noisy_image_v[:, noisy_img_start:noisy_img_end],
+                    noisy_action_v[:, action_start:action_end],
+                    noisy_state_v[:, state_start:state_end]
+                ], dim=1)
             
             output[:, action_start:action_end] = self.attn(q_block, k_context, v_context)
         
@@ -1073,11 +1144,54 @@ class CausalWanSelfAttention(nn.Module):
             new_v = new_v[:, -self.max_attention_size:]
 
             if action_register_length is not None:
-                x = self.attn(
-                    torch.cat([roped_query, roped_action_query], dim=1),
-                    torch.cat([new_k, roped_action_key], dim=1),
-                    torch.cat([new_v, action_v], dim=1),
-                )
+                if not self.decouple_action_dynamics and not self.decouple_dynamics_action:
+                    # Original joint attention: video + action share one full-context attention call
+                    # (video sees action, action sees the current noisy video). Kept byte-for-byte.
+                    x = self.attn(
+                        torch.cat([roped_query, roped_action_query], dim=1),
+                        torch.cat([new_k, roped_action_key], dim=1),
+                        torch.cat([new_v, action_v], dim=1),
+                    )
+                else:
+                    # Video (dynamics) tokens attend to cached observations + current noisy block,
+                    # plus the action register UNLESS decouple_dynamics_action cuts the video->action
+                    # link. When cut, we still keep the STATE part of the register so the video keeps
+                    # attending to state (consistent with the teacher-forcing path). The register is
+                    # laid out as [action | state] (see rope_action_apply).
+                    if self.decouple_dynamics_action:
+                        chunk_size = action_register_length // (
+                            self.num_action_per_block + self.num_state_per_block)
+                        action_horizon = chunk_size * self.num_action_per_block
+                        state_key = roped_action_key[:, action_horizon:]
+                        state_v_reg = action_v[:, action_horizon:]
+                        x_video = self.attn(
+                            roped_query,
+                            torch.cat([new_k, state_key], dim=1),
+                            torch.cat([new_v, state_v_reg], dim=1),
+                        )
+                    else:
+                        x_video = self.attn(
+                            roped_query,
+                            torch.cat([new_k, roped_action_key], dim=1),
+                            torch.cat([new_v, action_v], dim=1),
+                        )
+                    # Action tokens attend to their register + the video context. When
+                    # decouple_action_dynamics is on, the video context drops this step's noisy block
+                    # (the last `num_new_tokens` of new_k/new_v) so the action never sees the
+                    # being-generated ("future") video.
+                    if self.decouple_action_dynamics:
+                        cache_len = new_k.shape[1] - num_new_tokens
+                        action_k_ctx = new_k[:, :cache_len]
+                        action_v_ctx = new_v[:, :cache_len]
+                    else:
+                        action_k_ctx = new_k
+                        action_v_ctx = new_v
+                    x_action = self.attn(
+                        roped_action_query,
+                        torch.cat([action_k_ctx, roped_action_key], dim=1),
+                        torch.cat([action_v_ctx, action_v], dim=1),
+                    )
+                    x = torch.cat([x_video, x_action], dim=1)
             else:
                 x = self.attn(
                     roped_query,
@@ -1108,7 +1222,10 @@ class CausalWanAttentionBlock(nn.Module):
                  cross_attn_norm=False,
                  eps=1e-6,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 decouple_action_dynamics=False,
+                 decouple_dynamics_action=False,
+                 action_skip_noisy_video=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1131,6 +1248,9 @@ class CausalWanAttentionBlock(nn.Module):
             eps=eps,
             num_action_per_block=num_action_per_block,
             num_state_per_block=num_state_per_block,
+            decouple_action_dynamics=decouple_action_dynamics,
+            decouple_dynamics_action=decouple_dynamics_action,
+            action_skip_noisy_video=action_skip_noisy_video,
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -1290,7 +1410,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  diffusion_model_pretrained_path=None,
                  num_action_per_block=32,
                  num_state_per_block=1,
-                 concat_first_frame_latent=True):
+                 concat_first_frame_latent=True,
+                 decouple_action_dynamics=False,
+                 decouple_dynamics_action=False,
+                 action_skip_noisy_video=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1361,6 +1484,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.concat_first_frame_latent = concat_first_frame_latent
+        # Decouple action attention from the noisy/generated video tokens (see
+        # CausalWanSelfAttention). Default False = original joint attention behavior.
+        self.decouple_action_dynamics = decouple_action_dynamics
+        # Mirror flag: when True, the noisy/generated video tokens do NOT attend to the action block
+        # (removes the video->action link). Default False. Enabling both fully decouples the
+        # action and video pathways.
+        self.decouple_dynamics_action = decouple_dynamics_action
+        # Alias of decouple_action_dynamics (action-loss-only branch's name for the same action->video
+        # cut). Stored so it round-trips through the saved config; the actual behavior is driven by
+        # decouple_action_dynamics (OR'd with this flag in CausalWanSelfAttention).
+        self.action_skip_noisy_video = action_skip_noisy_video
 
         max_num_embodiments = 1
 
@@ -1399,7 +1533,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, frame_seqlen,
                                     self.local_attn_size, sink_size, num_frame_per_block, qk_norm, cross_attn_norm, eps,
-                                    num_action_per_block, num_state_per_block)
+                                    num_action_per_block, num_state_per_block,
+                                    decouple_action_dynamics=decouple_action_dynamics,
+                                    decouple_dynamics_action=decouple_dynamics_action,
+                                    action_skip_noisy_video=action_skip_noisy_video)
             for _ in range(num_layers)
         ])
 

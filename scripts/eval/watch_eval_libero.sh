@@ -10,10 +10,12 @@
 #   OUTPUT_DIR=$PWD/checkpoints/dreamzero_libero_wan22 SERVER_GPU=7 bash scripts/eval/watch_eval_libero.sh
 # Extra flags are passed through, e.g.:
 #   ... bash scripts/eval/watch_eval_libero.sh --num-trials-per-task 20 --max-tasks 5
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate dreamzero
+# Conda location is configurable: set CONDA_SH to your conda's profile.d/conda.sh (defaults to
+# /root/miniconda3) and CONDA_ENV to the GPU env name (defaults to dreamzero).
+source "${CONDA_SH:-/root/miniconda3/etc/profile.d/conda.sh}"
+conda activate "${CONDA_ENV:-dreamzero}"
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export CUDA_HOME=/usr/local/cuda
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH=$CUDA_HOME/bin:$PATH
 set -a; . ./.env; set +a          # WANDB_API_KEY (+ HF_TOKEN)
 
@@ -26,6 +28,11 @@ EXTRA=()
 # share one *live* run (the second writer's points are silently dropped). Set SEPARATE_RUN=0 to
 # attempt same-run logging (not recommended).
 [ "${SEPARATE_RUN:-1}" = "1" ] && EXTRA+=(--separate-run)
+# Explicit-conditioning eval: CONTEXT_MODE=C + REPLAN_STEPS=24 runs grounded conditioning with the
+# aligned block cadence (1 query = 1 block). Unset -> baseline eval (context_mode=baseline, replan 5).
+[ -n "$CONTEXT_MODE" ] && EXTRA+=(--context-mode "$CONTEXT_MODE")
+[ -n "$REPLAN_STEPS" ] && EXTRA+=(--replan-steps "$REPLAN_STEPS")
+[ "${SAVE_VIDEO_PRED:-0}" = "1" ] && EXTRA+=(--save-video-pred)
 
 exec python eval_utils/watch_and_eval_libero.py \
     --output-dir "$OUTPUT_DIR" \
@@ -35,6 +42,7 @@ exec python eval_utils/watch_and_eval_libero.py \
     --max-tasks "${MAX_TASKS:-3}" \
     --keep-best-n "${KEEP_BEST:-0}" \
     --keep-latest-n "${KEEP_LATEST:-5}" \
+    --upload-best-n "${UPLOAD_BEST:-2}" \
     --milestone-interval "${MILESTONE_INTERVAL:-0}" \
     --mujoco-gl "${MUJOCO_GL_BACKEND:-osmesa}" \
     "${EXTRA[@]}" \

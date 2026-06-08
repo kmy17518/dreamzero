@@ -3,7 +3,7 @@
 Standalone recipe to evaluate a **DreamZero‑LIBERO action/dynamics-decoupled** checkpoint on a
 **single 80 GB GPU**, producing both the usual **binary success rate** *and* the **soft / progress
 (partial-stage) scores** added in `eval_utils/run_libero_eval.py`. Runs all **4 eval task suites**
-(`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`) with **5 trials/task** and writes
+(`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`) with **3 trials/task** and writes
 **detailed per-task metrics**.
 
 This is the soft-eval guide for the **`libero_al_dl_decoupled`** branch, which carries the two
@@ -41,7 +41,7 @@ otherwise auto-downloads it from the public Wan repos.
 
 - **1 GPU with ≥ 80 GB** (any arch: H100/H200/A100-80G/B200/B300). Eval uses ~30–40 GB VRAM.
 - **CUDA 12.x toolkit** at `/usr/local/cuda` (provides `nvcc`), plus `git`, `tmux`.
-- **Headless MuJoCo rendering libs** (OSMesa = robust CPU rendering on a single GPU):
+- **Headless MuJoCo rendering libs** (EGL GPU rendering is the fast default; OSMesa is the CPU fallback):
   ```bash
   sudo apt-get update -y && sudo apt-get install -y libosmesa6 libgl1-mesa-glx libglfw3 patchelf
   ```
@@ -238,8 +238,10 @@ clash).
 conda activate dreamzero && cd "$DZ"
 export CKPT=$CKPT_DIR/checkpoint-${CKPT_STEP:?set this to the step you have, e.g. 36000}
 
-# EAGER path (works on every GPU arch, incl. Blackwell). On Hopper/A100 you MAY drop the two
-# TORCHDYNAMO/TORCH_COMPILE vars for a faster (compiled) server.
+# EAGER server (recommended for eval): works on every GPU arch (incl. Blackwell) and starts fast —
+# no multi-minute torch.compile, negligible first-call warmup, ~1.5 s/policy-call on an H100. On
+# Hopper/A100 you *may* drop the two vars for a compiled server (lower per-step latency), but the
+# compile startup only pays off on the very long full run; for smoke/a few suites eager is faster.
 TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1 CUDA_VISIBLE_DEVICES=0 \
 python eval_utils/serve_dreamzero_libero.py \
     --model_path "$CKPT" --embodiment_tag libero_sim \
@@ -249,17 +251,17 @@ Wait for `server listening on 0.0.0.0:8002` before starting Terminal B. (No deco
 it is read from the checkpoint's `config.json` and applied because the server imports this branch's
 decoupled attention code — see §0.)
 
-### Terminal B — sim client: all 4 suites × 5 trials/task, with progress scores
+### Terminal B — sim client: all 4 suites × 3 trials/task, with progress scores
 ```bash
 conda activate dreamzero_libero && cd "$DZ"
 export OUT=./eval_outputs/soft_decoupled        # bidir: ./eval_outputs/soft_decoupled_bidir
 export PORT=8002                                 # bidir: 8003
 for SUITE in libero_spatial libero_object libero_goal libero_10; do
   echo "==== $SUITE ===="
-  MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py \
+  MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 python eval_utils/run_libero_eval.py \
       --host 0.0.0.0 --port "$PORT" \
       --task-suite-name "$SUITE" \
-      --num-trials-per-task 5 \
+      --num-trials-per-task 3 \
       --progress-scores \
       --video-out-path "$OUT/$SUITE/videos" \
       --metrics-out-path "$OUT/$SUITE/metrics.json"
@@ -273,16 +275,17 @@ done
 
 **Smoke test first** (recommended, ~2 min) before the multi-hour full run:
 ```bash
-MUJOCO_GL=osmesa python eval_utils/run_libero_eval.py --host 0.0.0.0 --port "$PORT" \
+MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 python eval_utils/run_libero_eval.py --host 0.0.0.0 --port "$PORT" \
     --task-suite-name libero_goal --max-tasks 1 --num-trials-per-task 2 --max-steps-override 120 \
     --video-out-path ./eval_outputs/smoke/videos --metrics-out-path ./eval_outputs/smoke/metrics.json
 ```
 
-> **Runtime:** ~1–3 min/episode (OSMesa CPU rendering; `libero_10` is longer at 520 steps). The full
-> 4 suites × 10 tasks × 5 trials = **200 episodes** ≈ a few hours. To speed up: use the **compiled**
-> server on Hopper/A100 (drop the dynamo vars), and/or GPU rendering with `MUJOCO_GL=egl
-> MUJOCO_EGL_DEVICE_ID=0` (faster, but on a single shared GPU EGL can occasionally SIGABRT — OSMesa is
-> the robust default).
+> **Runtime (eager server + EGL):** ~**40 s/episode** measured on one H100 (≈1.5 s/policy-call ×
+> ~22 calls + EGL GPU rendering; `libero_10` is longer at 520 steps). The full 4 suites × 10 tasks ×
+> 3 trials = **120 episodes** ≈ 1–1.5 h. EGL GPU rendering is much faster than the OSMesa CPU path the
+> doc previously used (~1–3 min/episode). Set `MUJOCO_EGL_DEVICE_ID` to the **same GPU as the server**;
+> on a heavily shared GPU EGL can occasionally SIGABRT — fall back to `MUJOCO_GL=osmesa` (needs
+> `libosmesa6` from §0) if so.
 
 ---
 
@@ -295,25 +298,25 @@ One `metrics.json` per suite under `eval_outputs/soft_decoupled/<suite>/` (or
 ```json
 {
   "task_suite_name": "libero_spatial",
-  "num_trials_per_task": 5,
-  "overall_success_rate": 0.6,
-  "overall_mean_progress": 0.83,
+  "num_trials_per_task": 3,
+  "overall_success_rate": 0.5,
+  "overall_mean_progress": 0.8,
   "per_task": [
     {
       "task_id": 0,
       "task_description": "pick up the black bowl ... place it on the plate",
-      "episodes": 5, "successes": 3, "success_rate": 0.6,
+      "episodes": 3, "successes": 1, "success_rate": 0.333,
       "progress": {
-        "mean_episode_progress": 0.85,
+        "mean_episode_progress": 0.75,
         "subgoals": [
           {
             "pred": "on", "args": ["akita_black_bowl_1", "plate_1"],
             "stages": ["approach_src", "grasp_src", "approach_tgt", "done"],
-            "reach_fraction": [1.0, 1.0, 0.8, 0.6]
+            "reach_fraction": [1.0, 1.0, 0.667, 0.333]
           }
         ],
-        "episode_progress": [1.0, 1.0, 1.0, 0.75, 0.5],
-        "episode_max_stages": [[4], [4], [4], [3], [2]]
+        "episode_progress": [1.0, 0.75, 0.5],
+        "episode_max_stages": [[4], [3], [2]]
       }
     }
   ]
@@ -322,8 +325,8 @@ One `metrics.json` per suite under `eval_outputs/soft_decoupled/<suite>/` (or
 
 How to read it:
 - **`reach_fraction[k]`** = fraction of trials that reached at least stage *k* (so `reach_fraction[-1]`
-  equals `success_rate`). Above: every trial approached + grasped the bowl, 80 % got it over the plate,
-  60 % actually placed it.
+  equals `success_rate`). Above (3 trials): every trial approached + grasped the bowl, 2/3 (67 %) got it
+  over the plate, 1/3 (33 %) actually placed it.
 - **`episode_progress`** = per-trial `max_stage_reached / num_stages` (soft-credit latched).
 - **`mean_episode_progress`** / **`overall_mean_progress`** = those averaged per task / per suite.
 - **Families differ in stage count:** push sub-goals have 3 stages
@@ -350,11 +353,14 @@ the final place) rather than collapsing every near-miss to 0.
    (`decouple_action_dynamics=true`; plus `decouple_dynamics_action=true` for bidir).
 3. **`--tokenizer_path` is mandatory on a fresh box.** The checkpoint's baked `tokenizer_path` is an
    absolute path from the training machine; pass `./checkpoints/umt5-xxl` to override it.
-4. **Compile toggle:** eager (`TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1`) is universal; on
-   Hopper/A100 you can drop both for a faster compiled server. On Blackwell keep eager (bundled
-   `ptxas` can't target `sm_103a`).
-5. **Rendering backend:** `MUJOCO_GL=osmesa` (CPU) is the robust single-GPU default; `MUJOCO_GL=egl`
-   (set `MUJOCO_EGL_DEVICE_ID=0`) is faster but can clash with the server on the same GPU.
+4. **Compile toggle:** eager (`TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1`) is the recommended
+   default — universal and fast-starting (negligible warmup, ~1.5 s/policy-call on H100). Dropping both
+   for a compiled server lowers per-step latency but costs minutes of startup compile that only a very
+   long run amortizes. On Blackwell keep eager (bundled `ptxas` can't target `sm_103a`).
+5. **Rendering backend:** `MUJOCO_GL=egl` (set `MUJOCO_EGL_DEVICE_ID` to the server's GPU) is the
+   recommended default — GPU rendering is much faster than OSMesa CPU rendering (~40 s vs ~1–3 min per
+   episode here). Fall back to `MUJOCO_GL=osmesa` (needs `libosmesa6`) only if EGL SIGABRTs on a
+   heavily shared GPU.
 6. **Progress thresholds** (`--approach-dist`, `--place-dist`) are heuristics for the *intermediate*
    stages; `grasp_src` (fingerpad contact) and `done` (exact BDDL predicate) need no tuning. Because of
    soft-credit, `progress == 1.0` always coincides with binary success regardless of thresholds.

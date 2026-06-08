@@ -26,6 +26,11 @@ EXTRA=()
 # share one *live* run (the second writer's points are silently dropped). Set SEPARATE_RUN=0 to
 # attempt same-run logging (not recommended).
 [ "${SEPARATE_RUN:-1}" = "1" ] && EXTRA+=(--separate-run)
+# Explicit-conditioning eval: CONTEXT_MODE=C + REPLAN_STEPS=24 runs grounded conditioning with the
+# aligned block cadence (1 query = 1 block). Unset -> baseline eval (context_mode=baseline, replan 5).
+[ -n "$CONTEXT_MODE" ] && EXTRA+=(--context-mode "$CONTEXT_MODE")
+[ -n "$REPLAN_STEPS" ] && EXTRA+=(--replan-steps "$REPLAN_STEPS")
+[ "${SAVE_VIDEO_PRED:-0}" = "1" ] && EXTRA+=(--save-video-pred)
 
 exec python eval_utils/watch_and_eval_libero.py \
     --output-dir "$OUTPUT_DIR" \

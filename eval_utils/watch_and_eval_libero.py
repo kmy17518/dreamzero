@@ -321,7 +321,10 @@ def start_server(args, ckpt_dir: str, server_log_path: str) -> subprocess.Popen:
         "--tokenizer_path", args.tokenizer_path,
         "--host", "127.0.0.1",
         "--port", str(args.port),
+        "--context_mode", args.context_mode,
     ]
+    if args.save_video_pred:
+        cmd += ["--save_video_pred", "--video_output_dir", args.video_pred_dir]
     log(f"starting server: CUDA_VISIBLE_DEVICES={args.server_gpu} {' '.join(cmd)}")
     fh = open(server_log_path, "w")
     return subprocess.Popen(
@@ -359,6 +362,7 @@ def run_client(args, step, eval_out_root) -> str | None:
         "--host", "127.0.0.1", "--port", str(args.port),
         "--task-suite-name", args.task_suite_name,
         "--num-trials-per-task", str(args.num_trials_per_task),
+        "--replan-steps", str(args.replan_steps),
         "--video-out-path", videos_dir,
         "--metrics-out-path", metrics_path,
     ]
@@ -384,6 +388,22 @@ def main():
     ap.add_argument("--task-suite-name", default="libero_spatial")
     ap.add_argument("--num-trials-per-task", type=int, default=10)
     ap.add_argument("--max-tasks", type=int, default=0)
+    # Explicit-conditioning eval knobs (forwarded to the server/client; default = baseline eval).
+    ap.add_argument("--context-mode", default="baseline", choices=["baseline", "C"],
+                    help="cross-query video conditioning scheme on the policy server: 'baseline' "
+                         "(original eval, generated video discarded across queries) or 'C' (grounded "
+                         "explicit conditioning: re-anchor on the current real obs + the previously "
+                         "generated frontier block each query)")
+    ap.add_argument("--replan-steps", type=int, default=5,
+                    help="actions executed per query before re-querying. For feedback modes "
+                         "(--context-mode C) set this to num_action_per_block (24) so 1 query = 1 "
+                         "block and the fed-back frontier aligns 1:1 with the next real observation; "
+                         "baseline uses 5 (more reactive closed-loop control)")
+    ap.add_argument("--save-video-pred", action="store_true",
+                    help="have the server save the model's generated/imagined video per episode "
+                         "(useful to inspect what context_mode=C is feeding back)")
+    ap.add_argument("--video-pred-dir", default="./video_pred_output",
+                    help="output dir for --save-video-pred (a checkpoint-N subdir is appended)")
     ap.add_argument("--max-steps-override", type=int, default=0)
     ap.add_argument("--save-videos", action="store_true", default=True)
     ap.add_argument("--no-save-videos", dest="save_videos", action="store_false")
@@ -474,6 +494,7 @@ def main():
 
     log(f"watching {output_dir} | server-gpu={args.server_gpu} | suite={args.task_suite_name} "
         f"trials/task={args.num_trials_per_task} max_tasks={args.max_tasks or 'all'} | "
+        f"context_mode={args.context_mode} replan_steps={args.replan_steps} | "
         f"latest_only={args.latest_only} | keep_latest={args.keep_latest_n} keep_best={args.keep_best_n}"
         + (f" | upload->{args.upload_repo} (best-{args.upload_best_n} + latest"
            f"{f' + milestones/{args.milestone_interval}' if args.milestone_interval else ''}"

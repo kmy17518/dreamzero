@@ -212,6 +212,12 @@ class WANPolicyHead(ActionHead):
         self.clip_feas = None
         self.ys = None
         self.current_start_frame = 0
+        # Grounded explicit conditioning (eval context_mode=C). When True the server forces a fresh
+        # sequence every query (current_start_frame=0) and hands the previously generated block in via
+        # `latent_video`; that block is primed as the single clean context block right after the real
+        # anchor, so the KV cache is always [real anchor, one generated frontier] and never accumulates
+        # the model's own generations. Default False -> baseline/training behavior is unchanged.
+        self.grounded_context = False
         self.language = None
 
         self.ip_rank = 0
@@ -1205,7 +1211,40 @@ class WANPolicyHead(ActionHead):
             
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
-        if self.current_start_frame != 1:
+        # ===== Grounded explicit conditioning (context_mode=C) =====
+        # The server forces a fresh sequence every query (current_start_frame reset to 0), so the real
+        # current observation was just primed as the anchor at position 0 (current_start_frame == 1 now).
+        # Prime the single stored generated frontier block (passed in via `latent_video`) as the next
+        # clean context block. This both (a) injects the explicit-conditioning signal and (b) advances
+        # current_start_frame past the unsupervised a_{-1} slot, so the generation below yields the
+        # aligned action directly (no regeneration needed). At episode start there is no frontier yet,
+        # so this is skipped and generation falls through anchored on the real frame alone.
+        if getattr(self, "grounded_context", False) and latent_video is not None and self.current_start_frame == 1:
+            if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+            else:
+                y = self.ys[:, :, -self.num_frame_per_block:]
+            self._run_diffusion_steps(
+                noisy_input=latent_video,
+                timestep=timestep * 0,
+                action=None,
+                timestep_action=None,
+                state=None,
+                embodiment_id=None,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=self.current_start_frame,
+                    update_kv_cache=True,
+                ),
+            )
+            self.current_start_frame += self.num_frame_per_block
+
+        if self.current_start_frame != 1 and not getattr(self, "grounded_context", False):
             current_ref_latents = image[:, -self.num_frame_per_block:]
             if self.current_start_frame <= self.ys.shape[2]:
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]

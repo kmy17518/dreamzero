@@ -158,6 +158,7 @@ class DreamZeroLiberoPolicy(BasePolicy):
         save_video_pred: bool = False,
         video_output_dir: str = "./video_pred_output",
         future_frame_shift: bool | None = None,
+        context_mode: str = "baseline",
     ):
         super().__init__()
         self._policy = groot_policy
@@ -195,6 +196,28 @@ class DreamZeroLiberoPolicy(BasePolicy):
         self._video_output_dir = video_output_dir
         self._video_pred_latents: list[torch.Tensor] = []
         self._current_prompt: str = ""
+        # Cross-query video conditioning scheme:
+        #   "baseline" : original DreamZero eval (re-grounds on real obs each query; generated
+        #                video is discarded across queries). Byte-for-byte unchanged.
+        #   "C"        : grounded explicit conditioning. Every query re-anchors on the CURRENT real
+        #                obs and primes ONLY the previously generated block as the frontier, so the
+        #                KV cache is rebuilt each query as [real anchor, one generated frontier] and
+        #                generations never accumulate. Requires future_frame_shift (auto-detected).
+        if context_mode not in ("baseline", "C"):
+            raise ValueError(
+                f"Unsupported context_mode={context_mode}; expected one of ['baseline', 'C']"
+            )
+        self._context_mode = context_mode
+        self._frontier_latent: torch.Tensor | None = None
+        ah = getattr(self._policy.trained_model, "action_head", None)
+        if ah is not None:
+            ah.grounded_context = (context_mode == "C")
+        if context_mode == "C":
+            logger.info(
+                "context_mode=C (grounded explicit conditioning): each query re-anchors on the current "
+                "real observation and primes only the previously generated block as the frontier; the "
+                "KV cache is rebuilt every query as [real anchor, generated frontier] (no accumulation)."
+            )
 
     def _convert_observation(self, obs: dict) -> dict:
         agent = obs.get("observation/image")
@@ -269,10 +292,30 @@ class DreamZeroLiberoPolicy(BasePolicy):
 
         converted_obs = self._convert_observation(obs)
         batch = Batch(obs=converted_obs)
+
+        # Grounded explicit conditioning (context_mode=C): force a fresh real-anchored sequence each
+        # query and hand the head the previous query's generated block as the single frontier. The
+        # episode-start no-op is still emitted by the future-frame-shift logic below (frontier is None
+        # at q0 -> current_start_frame lands on 1+nfpb -> no-op); every later query returns the aligned
+        # action directly because the frontier prime advances the cache past the a_{-1} slot.
+        latent_video = None
+        ah = getattr(self._policy.trained_model, "action_head", None)
+        if self._context_mode == "C":
+            if ah is not None:
+                ah.grounded_context = True
+                ah.current_start_frame = 0
+            latent_video = self._frontier_latent
+
         with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, latent_video=latent_video)
         if self._save_video_pred and video_pred is not None:
             self._video_pred_latents.append(video_pred.detach())
+
+        # Cache the just-generated frontier block (last num_frame_per_block latent frames) so the next
+        # query conditions on it as the grounded frontier.
+        if self._context_mode == "C" and video_pred is not None:
+            nfpb = int(getattr(ah, "num_frame_per_block", 2)) if ah is not None else 2
+            self._frontier_latent = video_pred[:, :, -nfpb:].clone()
 
         action_chunk = result_batch.act
         action_dict = {k: v for k, v in action_chunk.items() if k.startswith("action.")}
@@ -339,6 +382,7 @@ class DreamZeroLiberoPolicy(BasePolicy):
         if self._save_video_pred:
             self._save_predicted_video()
         self._video_pred_latents.clear()
+        self._frontier_latent = None
         self._current_prompt = ""
         for key in self._frame_buffers:
             self._frame_buffers[key] = []
@@ -363,6 +407,7 @@ def main(
     video_output_dir: str = "./video_pred_output",
     model_config_overrides: list[str] | None = None,
     future_frame_shift: bool | None = None,
+    context_mode: str = "baseline",
 ) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
 
@@ -395,6 +440,7 @@ def main(
         save_video_pred=save_video_pred,
         video_output_dir=video_output_dir,
         future_frame_shift=future_frame_shift,
+        context_mode=context_mode,
     )
 
     server_config = PolicyServerConfig(

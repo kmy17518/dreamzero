@@ -60,6 +60,7 @@ class Args:
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
     max_tasks: int = 0  # 0 = all tasks in the suite; >0 limits tasks (for smoke tests)
+    task_ids: tuple[int, ...] = ()  # explicit task ids to run (in this order); overrides max_tasks
     max_steps_override: int = 0  # 0 = use the suite default; >0 overrides the per-episode step cap
 
     # Outputs
@@ -281,13 +282,17 @@ def eval_libero(args: Args) -> None:
     client = WebsocketClientPolicy(args.host, args.port)
     logging.info("Connected. Server metadata: %s", client.get_server_metadata())
 
-    n_tasks = num_tasks_in_suite if args.max_tasks <= 0 else min(args.max_tasks, num_tasks_in_suite)
+    if args.task_ids:
+        task_id_list = [t for t in args.task_ids if 0 <= t < num_tasks_in_suite]
+    else:
+        n_tasks = num_tasks_in_suite if args.max_tasks <= 0 else min(args.max_tasks, num_tasks_in_suite)
+        task_id_list = list(range(n_tasks))
 
     total_episodes, total_successes = 0, 0
     per_task_metrics = []
     t_start = time.time()
 
-    for task_id in tqdm.tqdm(range(n_tasks), desc="tasks"):
+    for task_id in tqdm.tqdm(task_id_list, desc="tasks"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
